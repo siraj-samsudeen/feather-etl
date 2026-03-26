@@ -1,8 +1,15 @@
 # feather-etl: Product Requirements Document
 
-**Version:** 1.2
+**Version:** 1.3
 **Date:** 2026-03-26
 **Status:** Draft
+
+| Version | Changes |
+|---------|---------|
+| 1.0 | Initial draft |
+| 1.1 | Source abstraction, file-based sources added |
+| 1.2 | NFR updates, connector interface design |
+| 1.3 | Excel reader corrected (read_xlsx + openpyxl); Slack replaced with SMTP email; bronze made optional; append strategy added; silver redefined as canonical mapping layer; connector/transform library roadmap added; schema drift behavior (Option B) defined; product scope clarified for multi-client deployment |
 
 ---
 
@@ -10,9 +17,11 @@
 
 ### What
 
-feather-etl is a lightweight, config-driven Python ETL **package** for extracting data from multiple source types, transforming it with plain SQL in local DuckDB, and optionally syncing final tables to a remote destination.
+feather-etl is a config-driven Python ETL **package** for extracting data from heterogeneous ERP and database sources, transforming it with plain SQL in local DuckDB, and syncing final tables to a remote destination for dashboards and analytics.
 
-The core package works entirely with file-based sources (DuckDB, SQLite, CSV, Excel, JSON) and local DuckDB as the destination — fully testable without any external servers. Client projects extend it with database sources (SQL Server) and cloud destinations (MotherDuck).
+The core package works entirely with file-based sources (DuckDB, SQLite, CSV, Excel, JSON) and local DuckDB as the destination — fully testable without any external servers. Client deployments extend it with database sources (SQL Server, SAP B1, SAP S4 HANA, custom ERPs) and cloud destinations (MotherDuck).
+
+feather-etl is designed to be deployed across many clients, each with their own source systems and schemas. It is the entire data platform for small-to-medium clients who have no existing data infrastructure, and a lightweight extraction layer for larger clients who already have their own bronze/raw layer.
 
 ### What It Replaces
 
@@ -35,6 +44,8 @@ The current stack introduces a "complexity tax": hundreds of transitive dependen
 - **Config-driven.** YAML defines what to extract, how to transform, when to schedule. Adding a table means editing YAML, not writing Python.
 - **Local-first.** Extract and transform locally in DuckDB (free compute). Push only final gold tables to remote destinations (minimizes cloud cost).
 - **Testable.** The entire pipeline is end-to-end testable using file-based sources and local DuckDB — no mocking required for core functionality.
+- **Multi-client by design.** Each client deployment is an independent `feather.yaml` configuration. The package is source-system agnostic — SAP B1, custom Indian ERPs, SQL Server all use the same pipeline. A connector and canonical transform library (planned, not v1) will allow reuse of silver mappings across clients with the same source system.
+- **Layers are optional.** Bronze, silver, and gold schemas exist but are not all mandatory. Small clients with no compliance requirement can skip bronze and land directly into silver. Large enterprise clients who already have a bronze layer can use feather-etl as an extraction-only layer.
 
 ---
 
@@ -43,7 +54,8 @@ The current stack introduces a "complexity tax": hundreds of transitive dependen
 ### Primary Users
 
 1. **Package developer** — builds and tests feather-etl itself, using file-based sources
-2. **Data platform operator** — uses feather-etl in a client project, configuring SQL Server sources and MotherDuck destinations
+2. **Data platform operator** (internal team) — deploys and configures feather-etl per client; writes silver/gold SQL transforms; manages schedules and alerts
+3. **Client analyst** — works at the client site; does last-mile customisation of gold transforms and dashboards, guided by LLM agents; does not write extraction config or Python
 
 ### Use Cases
 
@@ -66,7 +78,7 @@ Operator checks run history (`feather history`), sees a DQ failure, queries `_ru
 Operator adds a table entry to `feather.yaml`, optionally adds silver/gold SQL. Runs `feather setup` then `feather run --table new_table`.
 
 **UC7: Schema Change Detection**
-Source system changes columns. feather-etl detects drift via schema snapshot comparison, logs it, sends a Slack alert.
+Source system changes columns. feather-etl detects drift via schema snapshot comparison, logs it, sends an email alert. Added columns are loaded automatically. Removed columns are loaded as NULL. Type changes attempt a cast; failures are quarantined with a critical alert.
 
 ---
 
@@ -81,7 +93,7 @@ Source system changes columns. feather-etl detects drift via schema snapshot com
 | `duckdb` | DuckDB ATTACH | File mtime + file hash | Yes (if timestamp column exists) |
 | `sqlite` | DuckDB `sqlite_scan()` | File mtime + file hash | Yes (if timestamp column exists) |
 | `csv` | DuckDB `read_csv()` | File mtime + file hash | No (full refresh only) |
-| `excel` | DuckDB `st_read()` | File mtime + file hash | No (full refresh only) |
+| `excel` | `read_xlsx()` via DuckDB `excel` extension; `.xls` files fall back to `openpyxl` | File mtime + file hash | No (full refresh only) |
 | `json` | DuckDB `read_json()` | File mtime + file hash | No (full refresh only) |
 | `sqlserver` | pyodbc → PyArrow | CHECKSUM_AGG + COUNT(*) | Yes (timestamp watermark) |
 
@@ -100,7 +112,18 @@ Source system changes columns. feather-etl detects drift via schema snapshot com
 # CSV example
 temp_con.execute("SELECT * FROM read_csv(?)", [file_path])
 arrow_table = temp_con.fetcharrow()
+
+# Excel .xlsx example (DuckDB excel extension)
+temp_con.execute("INSTALL excel; LOAD excel;")
+temp_con.execute("SELECT * FROM read_xlsx(?)", [file_path])
+arrow_table = temp_con.fetcharrow()
+
+# Excel .xls fallback (openpyxl)
+import openpyxl
+# convert to Arrow via PyArrow directly
 ```
+
+For `.xlsx` files, use DuckDB's `excel` extension (`read_xlsx()`). For `.xls` files, fall back to `openpyxl` and convert to a PyArrow Table before passing to the loader. If a file path ends in `.xls`, the system shall log a warning that the native DuckDB reader does not support this format and openpyxl is being used.
 
 **FR1.6** For file-based sources with `strategy: incremental`, the system shall apply the same timestamp watermark logic as SQL Server: `WHERE {timestamp_column} >= {effective_watermark} ORDER BY {timestamp_column}`.
 
@@ -141,11 +164,14 @@ sync:                                 # optional remote sync
 **FR2.5** Each table shall be independently configurable with:
 - `name` — logical name (used in CLI, state, logs)
 - `source_table` — source table name or filename (e.g., `dbo.SALESINVOICE` or `customers.csv`)
-- `target_table` — local DuckDB target (e.g., `bronze.sales_invoice`)
-- `strategy` — `incremental` or `full` (replaces `checksum` as the generic term; checksum is an implementation detail of SQL Server change detection)
+- `target_table` — local DuckDB target (e.g., `silver.sales_invoice`). Defaults to `silver.{name}` if omitted.
+- `strategy` — `incremental`, `full`, or `append`:
+  - `full` — swap pattern (drop and recreate). Use for small reference tables with no history requirement.
+  - `incremental` — partition overwrite keyed on timestamp watermark. Use for large transactional tables.
+  - `append` — insert only, never delete. Use for audit trail, compliance, or when the operator wants to preserve full history. Requires `timestamp_column`.
 - `schedule` — human-readable schedule name or tier shortcut
 - `primary_key` — list of primary key columns
-- `timestamp_column` — (required for incremental) column used for watermarking
+- `timestamp_column` — (required for `incremental` and `append`) column used for watermarking
 - `checksum_columns` — (optional, sqlserver only) explicit column list for BINARY_CHECKSUM
 - `filter` — (optional) SQL WHERE clause applied at extraction
 - `quality_checks` — (optional) declarative DQ checks: `not_null`, `unique`
@@ -166,10 +192,13 @@ schedule_tiers:
 
 **FR2.9** Config validation shall enforce:
 - `strategy: incremental` requires `timestamp_column`
+- `strategy: append` requires `timestamp_column`
 - `schedule` must resolve to a known schedule name
 - `primary_key` is required for all tables
 - `source.type` must be a recognized source type
 - File-based source types require `source.path` to exist
+- `target_table` schema prefix must be one of: `bronze`, `silver`, `gold` (or omitted, defaulting to `silver`)
+- All relative paths (`destination.path`, `state.path`, `source.path`) are resolved relative to the `feather.yaml` file location, not CWD. Validation shall resolve and log the absolute path for each at startup so the operator can confirm locations before a run.
 
 ### FR3: Extraction
 
@@ -204,25 +233,50 @@ schedule_tiers:
 
 **FR4.1** Data shall be loaded into a local DuckDB file (configured in `destination.path`).
 
-**FR4.2** The local DuckDB shall have schemas: `bronze`, `silver`, `gold`, `_quarantine`.
+**FR4.2** The local DuckDB shall create schemas on `feather setup`: `bronze`, `silver`, `gold`, `_quarantine`. All four schemas are created regardless of whether they are used — this keeps the structure consistent across deployments and makes enterprise clients' expectations met out of the box.
 
-**FR4.3** For **full** (full refresh) tables, use the **swap pattern**:
+> **Decision: bronze is optional per table, not per deployment.**
+> The schema exists in every DuckDB file, but no table is forced into it. Bronze serves two distinct purposes depending on how it is configured:
+>
+> **1. Development cache** (`strategy: full` or `strategy: incremental`)
+> During active development, the operator extracts all columns from the source ERP into bronze once, then iterates on silver/gold transforms locally without hitting the source database again. ERP connections are slow, VPN-gated, and sometimes rate-sensitive — a local bronze snapshot eliminates that friction entirely. Silver views read from bronze; the operator tweaks the silver SQL and reruns `feather run` against the local cache. When transforms are stable, the operator can drop bronze and reconfigure to land directly into silver for production.
+>
+> **2. Audit trail / compliance cache** (`strategy: append`)
+> For regulated clients (Unilever, IOM, WHO scale), bronze is append-only — every extracted row is preserved forever with `_etl_loaded_at` and `_etl_run_id`. This enables point-in-time reconstruction, compliance audits, and re-derivation of silver/gold if transform logic changes.
+>
+> Small Indian SMB clients with no compliance requirement and stable transforms configure `target_table: silver.sales_invoice` and skip bronze entirely — landing column-selected, renamed data directly into silver. The operator decides per table, per client.
+
+**FR4.3** For **full** strategy tables, use the **swap pattern** (atomic, no partial reads during load):
 1. `CREATE TABLE {target}_new AS SELECT * FROM staging_data`
 2. `DROP TABLE IF EXISTS {target}`
 3. `ALTER TABLE {target}_new RENAME TO {final_name}`
 All within a single transaction.
 
-**FR4.4** For **incremental** tables, use **partition-based overwrite**:
+**FR4.4** For **incremental** strategy tables, use **partition-based overwrite**:
 1. `DELETE FROM {target} WHERE {timestamp_column} >= {min_timestamp_in_batch}`
 2. `INSERT INTO {target} SELECT *, current_timestamp AS _etl_loaded_at, {run_id} AS _etl_run_id FROM staging_data`
 
-**FR4.5** Every bronze row shall include two metadata columns:
+**FR4.5** For **append** strategy tables, use **insert-only**:
+1. `INSERT INTO {target} SELECT *, current_timestamp AS _etl_loaded_at, {run_id} AS _etl_run_id FROM staging_data`
+No deletes. Rows accumulate. The watermark advances so only new rows are fetched each run. Use for audit trail, compliance, or full history preservation. If the target table does not yet exist, it is created on first run.
+
+**FR4.6** Every loaded row shall include two metadata columns regardless of target schema (bronze, silver, or gold):
 - `_etl_loaded_at` (TIMESTAMP) — when the row was loaded
 - `_etl_run_id` (VARCHAR) — links to the `_runs` table
 
-**FR4.6** If a `column_map` is configured, renaming is applied at the PyArrow level (zero-copy) before loading.
+**FR4.7** If a `column_map` is configured, renaming is applied at the PyArrow level (zero-copy) before loading.
 
-**FR4.7** Loading and state update shall be wrapped in a single DuckDB transaction.
+**FR4.8** Loading and state update shall be wrapped in a single DuckDB transaction.
+
+**FR4.10** All three load strategies shall be idempotent — running `feather run --table X` twice in a row shall produce the same result as running it once:
+- `full` — guaranteed by the swap pattern (second run produces identical table)
+- `incremental` — guaranteed by partition delete + insert on the same watermark window
+- `append` — on retry after a partial failure, the system shall first delete any rows where `_etl_run_id` matches the failed run's ID, then re-insert. This prevents duplicate rows from partial writes.
+
+**FR4.9** Schema drift during load shall be handled as follows:
+- `added` column: ALTER TABLE to add the new column to the target, then load normally. Historical rows will have NULL for the new column.
+- `removed` column: load the batch with the missing column as NULL. Target table retains the column definition.
+- `type_changed`: attempt DuckDB cast. If cast succeeds, load proceeds. If cast fails, affected rows are routed to `_quarantine.{table_name}` and a `[CRITICAL]` email alert is sent. The run is marked as `partial_success` in `_runs`.
 
 ### FR5: Transforms
 
@@ -230,7 +284,10 @@ All within a single transaction.
 
 **FR5.2** Silver transforms shall be DuckDB **views** (`CREATE OR REPLACE VIEW`).
 
-**FR5.3** Gold transforms shall be DuckDB **materialized tables** (`CREATE OR REPLACE TABLE ... AS SELECT ...`), rebuilt after each extraction run.
+> **Decision: silver is the canonical mapping layer.**
+> Silver is where source-system-specific naming, column selection, and light cleaning happen. A SAP B1 table `ORDR` and a custom ERP table `SalesHeader` both become `silver.sales_order` with the same 10-15 columns in the same shape. Client analysts and LLM agents work against silver, not bronze. This is also the layer where the planned connector/transform library (v2) will provide reusable canonical mappings per source system — so the operator deploying a second SAP B1 client can reuse the silver transforms from the first.
+
+**FR5.3** Gold transforms shall be DuckDB **materialized tables** (`CREATE OR REPLACE TABLE ... AS SELECT ...`), rebuilt after each extraction run. Gold is client-specific — KPIs, aggregations, denormalized tables shaped for Rill dashboards or BI tools. Only gold tables are synced to MotherDuck.
 
 **FR5.4** SQL files may use `string.Template` variable substitution (`${variable}`).
 
@@ -256,7 +313,13 @@ All within a single transaction.
 
 ### FR7: State Management
 
-**FR7.1** State shall be stored in a local DuckDB file (`feather_state.duckdb`), separate from the data DuckDB.
+**FR7.1** State shall be stored in a local DuckDB file, separate from the data DuckDB. Path resolution order:
+1. Use `state.path` from `feather.yaml` if configured (absolute or relative to `feather.yaml` location)
+2. Otherwise default to `{feather.yaml directory}/feather_state.duckdb`
+
+The config file's directory is the anchor — not the current working directory — so the state DB location is stable regardless of how or where the process is invoked (CLI, cron, APScheduler daemon).
+
+The data DuckDB (`destination.path`) follows the same resolution: relative paths are resolved against `feather.yaml`'s directory, not CWD.
 
 **FR7.2** The state database shall contain these tables:
 
@@ -265,7 +328,7 @@ All within a single transaction.
 | Column | Type | Purpose |
 |--------|------|---------|
 | table_name | VARCHAR PK | Table identifier |
-| strategy | VARCHAR | incremental or full |
+| strategy | VARCHAR | incremental, full, or append |
 | last_value | VARCHAR | Last watermark (ISO timestamp) or NULL |
 | last_checksum | INTEGER | Last CHECKSUM_AGG value (sqlserver) or NULL |
 | last_row_count | INTEGER | Last COUNT(*) or NULL |
@@ -285,7 +348,7 @@ All within a single transaction.
 | started_at | TIMESTAMP | Run start |
 | ended_at | TIMESTAMP | Run end |
 | duration_sec | DOUBLE | Duration |
-| status | VARCHAR | success, failure, skipped |
+| status | VARCHAR | success, failure, skipped, partial_success |
 | rows_extracted | INTEGER | Rows read from source |
 | rows_loaded | INTEGER | Rows written to DuckDB |
 | rows_skipped | INTEGER | Rows filtered/deduplicated |
@@ -326,7 +389,15 @@ All within a single transaction.
 | data_type | VARCHAR | Source data type |
 | snapshot_at | TIMESTAMP | When snapshot taken |
 
-**FR7.3** Watermarks shall only be updated after successful load (and sync, if configured). On failure, the watermark stays unchanged.
+**FR7.3** Watermark update rules:
+- Watermark advances **only** when the entire pipeline step succeeds for that table
+- If sync is **not** configured: watermark advances after successful load
+- If sync is **configured**: watermark advances only after both load AND sync succeed
+- If load fails: watermark unchanged, data load transaction rolled back
+- If load succeeds but sync fails: watermark unchanged, loaded data remains in local DuckDB, next run re-extracts the same window and re-syncs
+
+> **Decision: sync failure rolls back the watermark, not the load.**
+> The load is committed to local DuckDB (it's in a transaction that already closed). Only the watermark advancement is withheld. This means on re-run, some rows may be re-loaded into local DuckDB (handled by idempotency, FR4.10) and re-synced to MotherDuck. This trades a small amount of redundant work for a hard guarantee: the watermark only reflects data that is fully visible in MotherDuck. The alternative — advancing the watermark after load regardless of sync — risks MotherDuck silently falling behind with no automated recovery path.
 
 **FR7.4** Boundary deduplication: for incremental tables, hash PKs of rows at the max watermark timestamp. Store in `boundary_hashes`. On next run, skip rows whose PK hash matches.
 
@@ -346,7 +417,7 @@ quality_checks:
 
 **FR8.3** DQ checks run after each load, against the local DuckDB table.
 
-**FR8.4** DQ failures are logged to `_dq_results` and trigger alerts, but do NOT block the pipeline.
+**FR8.4** DQ failures are logged to `_dq_results` and trigger email alert at `[WARNING]` severity (if configured), but do NOT block the pipeline.
 
 ### FR9: Schema Drift Detection
 
@@ -354,7 +425,7 @@ quality_checks:
 
 **FR9.2** Detect: `added` (new column), `removed` (column gone), `type_changed` (data type changed).
 
-**FR9.3** Schema changes logged in `_runs` and trigger alerts.
+**FR9.3** Schema changes logged in `_runs` and trigger email alert at `[INFO]` severity (if configured).
 
 **FR9.4** First run saves baseline — no drift reported.
 
@@ -390,19 +461,38 @@ quality_checks:
 
 ### FR12: Alerting
 
-**FR12.1** Alerts via Slack incoming webhook (`requests.post()`).
+**FR12.1** Alerts via SMTP email using Python stdlib `smtplib` + `email`. No additional dependency required.
 
-**FR12.2** Severities: critical (failures), warning (DQ issues), info (schema drift).
+**FR12.2** Email configuration via `feather.yaml` `alerts` section:
+```yaml
+alerts:
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  smtp_user: "${ALERT_EMAIL_USER}"
+  smtp_password: "${ALERT_EMAIL_PASSWORD}"
+  alert_to: "operator@example.com"
+  alert_from: "feather-etl@example.com"   # optional, defaults to smtp_user
+```
 
-**FR12.3** No-op if webhook not configured.
+**FR12.3** Severities map to email subject prefixes:
+- `[CRITICAL]` — pipeline failures, load errors
+- `[WARNING]` — DQ check failures
+- `[INFO]` — schema drift detected
+
+**FR12.4** No-op if `alerts` section is not configured. Pipeline runs silently.
 
 ### FR13: Retry and Error Handling
 
-**FR13.1** On failure: record run, increment retry_count, set retry_after (linear backoff), do NOT update watermark, send alert.
+**FR13.1** On failure: record run, increment `retry_count`, compute `retry_after` using linear backoff, do NOT update watermark, send `[CRITICAL]` email alert (if configured).
 
-**FR13.2** Skip table if `current_time < retry_after`.
+> **Decision: linear backoff, base 15 minutes, cap 2 hours.**
+> Formula: `retry_after = now + min(retry_count × 15 minutes, 120 minutes)`
+> After 1 failure: wait 15 min. After 2: 30 min. After 3: 45 min. Capped at 120 min from failure 8 onwards.
+> Exponential backoff was rejected — a backoff that reaches 8–16 hours defeats the purpose of a scheduled pipeline. Linear keeps the retry window predictable and within the operator's scheduling expectations. At cap, a persistent failure alerts every ~4 scheduled runs rather than going silent.
 
-**FR13.3** Reset retry_count on success.
+**FR13.2** Skip table if `current_time < retry_after`. Record status `skipped` in `_runs` with `error_message` referencing the original failure.
+
+**FR13.3** Reset `retry_count` to 0 and clear `retry_after` on any successful run.
 
 **FR13.4** Individual table failures do not prevent other tables from running.
 
@@ -420,11 +510,11 @@ quality_checks:
 | typer | CLI |
 | pyodbc | SQL Server extraction |
 | apscheduler | Built-in scheduling |
-| requests | Slack alerting |
+| openpyxl | `.xls` fallback reader for Excel sources (DuckDB `excel` extension handles `.xlsx` natively) |
 
-The package is complete out of the box — all source types, scheduling, and alerting are included. File-based sources are a testing strategy, not a reason to split dependencies.
+Alerting uses Python stdlib `smtplib` — no extra dependency. The package is complete out of the box — all source types, scheduling, and alerting are included.
 
-**NFR2: Code Size.** Core package under 1,200 lines of Python (increased from 1,000 to accommodate source abstraction).
+**NFR2: Code Size.** Core package under 1,210 lines of Python (increased from 1,000 to accommodate source abstraction; +10 for openpyxl Excel fallback).
 
 **NFR3: Performance.** Full extraction of ~700K rows within 5 minutes. Incremental extraction of ~1,000 rows within 10 seconds. File-based extraction within seconds regardless of size (DuckDB native readers are fast).
 
@@ -588,7 +678,7 @@ class DatabaseSource:
 | `JsonSource` | `FileSource` | ~20 | Sets `reader_function = "read_json"` |
 | `DuckDBFileSource` | `FileSource` | ~30 | ATTACH + SELECT (not a reader function) |
 | `SqliteSource` | `FileSource` | ~25 | Sets `reader_function = "sqlite_scan"` |
-| `ExcelSource` | `FileSource` | ~25 | Sets `reader_function = "st_read"` |
+| `ExcelSource` | `FileSource` | ~35 | `read_xlsx()` via DuckDB `excel` extension for `.xlsx`; `openpyxl` fallback for `.xls` |
 | `SqlServerSource` | `DatabaseSource` | ~80 | pyodbc connect, CHECKSUM_AGG query, INFORMATION_SCHEMA |
 | `DuckDBDestination` | (implements Destination) | ~100 | Swap + partition overwrite + ATTACH for MotherDuck |
 
@@ -614,6 +704,16 @@ def create_source(config: SourceConfig) -> Source:
 
 New source types are added by implementing the `Source` Protocol (or extending `FileSource`/`DatabaseSource`) and registering in the registry.
 
+### Planned: Connector and Canonical Transform Library (v2, not in scope for v1)
+
+feather-etl v1 is source-system agnostic — the operator writes all silver transforms per client. In v2, a separate `feather-connectors` package will provide:
+
+- **Source connectors** for common systems: SAP B1, SAP S4 HANA, Tally, custom Indian ERPs. Each connector ships with pre-built extraction config (table names, primary keys, timestamp columns, filters) so the operator configures credentials, not schema.
+- **Canonical silver transform library** — reusable `.sql` files that map source-system-specific column names to standard canonical names (`sales_order`, `customer`, `invoice`, etc.). A second SAP B1 client reuses the same silver transforms as the first, with only the gold layer customised per client.
+- **LLM agent interface** — client analysts interact with the canonical silver layer via an LLM-guided query interface. They do not write SQL or touch YAML.
+
+This is explicitly out of scope for v1. The v1 Protocol-based architecture is designed to accommodate v2 connectors without changes to the core package.
+
 ---
 
 ## 6. Architecture
@@ -630,25 +730,41 @@ Sources
 │   └── DuckDB files ──────────┘
 │
 ├── Database (production)
-│   └── SQL Server ── pyodbc ── → PyArrow Table
+│   ├── SQL Server ─────────────┐
+│   ├── SAP B1 ─────────────────┤ pyodbc → PyArrow Table
+│   └── Custom ERPs ────────────┘
 │
 ▼
 PyArrow Table (common format from all sources)
 │
+▼  column_map applied (zero-copy rename/select)
+│
 ▼
 Local DuckDB: feather_data.duckdb
-├── bronze schema (raw data + _etl_loaded_at + _etl_run_id)
-├── silver views (column renames, filters) — LOCAL ONLY
-├── gold materialized tables (JOINs, denormalized)
-└── _quarantine schema (bad rows)
+│
+├── bronze schema  ← OPTIONAL (compliance/audit clients only)
+│   Raw ERP data, all columns, strategy: append
+│   _etl_loaded_at + _etl_run_id on every row
+│
+├── silver schema  ← PRIMARY working layer
+│   Canonical column names, selected columns, light cleaning
+│   Views over bronze (if bronze used) OR direct load target
+│   Client analysts + LLM agents work here
+│
+├── gold schema    ← Dashboard layer
+│   Materialized tables: KPIs, aggregations, denormalized
+│   Rebuilt after every extraction run
+│   Only layer synced to MotherDuck
+│
+└── _quarantine schema  ← Bad rows from type_changed drift
 
 Local DuckDB: feather_state.duckdb
-├── _watermarks (with file mtime/hash for file sources)
+├── _watermarks (watermark + file mtime/hash + retry state)
 ├── _runs, _run_steps, _dq_results, _schema_snapshots
 
 Optional: Remote Sync
 └── MotherDuck (via ATTACH — gold tables only)
-    └── Rill Data (dashboards)
+    └── Rill Data / BI tools (dashboards)
 ```
 
 ### Module Breakdown
@@ -664,7 +780,7 @@ src/feather/
 │   ├── json.py                 ~20 LOC   JsonSource
 │   ├── duckdb_file.py          ~30 LOC   DuckDBFileSource
 │   ├── sqlite.py               ~25 LOC   SqliteSource
-│   ├── excel.py                ~25 LOC   ExcelSource
+│   ├── excel.py                ~35 LOC   ExcelSource (read_xlsx + openpyxl fallback)
 │   ├── sqlserver.py            ~80 LOC   SqlServerSource (pyodbc + CHECKSUM_AGG)
 │   └── registry.py             ~20 LOC   SOURCE_REGISTRY + create_source()
 ├── destinations/
@@ -673,7 +789,7 @@ src/feather/
 ├── state.py                   ~110 LOC   Watermarks, run history, DQ results
 ├── quality.py                  ~80 LOC   DQ checks (not_null, unique, row_count)
 ├── schema.py                   ~60 LOC   Schema drift detection + snapshots
-├── alerts.py                   ~40 LOC   Slack webhook
+├── alerts.py                   ~40 LOC   SMTP email alerts (smtplib)
 ├── pipeline.py                ~150 LOC   run_table() orchestrator
 ├── scheduler.py                ~80 LOC   APScheduler + presets
 └── cli.py                      ~80 LOC   typer CLI
@@ -689,22 +805,55 @@ src/feather/
 3. Check for changes (source-type-specific):
    ├── File sources: mtime check → hash check → skip if unchanged
    └── SQL Server (full strategy): CHECKSUM_AGG + COUNT(*) → skip if unchanged
+   (incremental + append strategies skip change detection — always extract)
 4. Extract data (source-type-specific):
    ├── File sources: DuckDB native reader → PyArrow
-   └── SQL Server: pyodbc → chunked fetch → PyArrow
-   For incremental: apply watermark filter + overlap window
-5. Apply column_map (if configured)
-6. Load to local DuckDB (swap or partition overwrite)
-7. Run DQ checks → log results
-8. Detect schema drift → log + alert
-9. Rebuild gold tables (rematerialize)
+   └── SQL Server / SAP / custom ERP: pyodbc → chunked fetch → PyArrow
+   For incremental + append: apply watermark filter + overlap window
+5. Apply column_map (zero-copy rename/select in PyArrow)
+6. Load to local DuckDB:
+   ├── full     → swap pattern (atomic drop + recreate)
+   ├── incremental → partition overwrite (delete + insert)
+   └── append   → insert only (no deletes)
+7. Run DQ checks → log to _dq_results → [WARNING] email if failures
+8. Detect schema drift → handle per FR4.9 → [INFO] or [CRITICAL] email
+9. Rebuild gold tables (rematerialize all gold transforms)
 10. Sync gold to remote (if configured)
 11. Update state (watermark + run record) in single transaction
-12. Alert on issues
-13. Return RunResult
+12. Return RunResult (success / failure / skipped / partial_success)
 ```
 
-### Example Config: File-Based Testing
+### Example Config: Development Workflow (bronze as local cache)
+
+During active development, extract all columns into bronze once, then iterate on silver/gold SQL transforms locally without hitting the source DB again.
+
+```yaml
+source:
+  type: sqlserver
+  connection_string: "${SQL_SERVER_CONNECTION_STRING}"
+
+destination:
+  path: ./feather_dev.duckdb
+
+state:
+  path: ./feather_dev_state.duckdb
+
+tables:
+  - name: sales_invoice
+    source_table: dbo.SALESINVOICE
+    target_table: bronze.sales_invoice   # all columns, local cache
+    strategy: full                       # swap — just a snapshot
+    primary_key: [ID]
+    schedule: daily                      # refresh once a day during dev
+```
+
+Silver transforms in `transforms/silver/sales_invoice.sql` read from bronze. The operator tweaks the SQL and runs `feather run` locally — no source DB hit. When transforms are stable and ready for production, reconfigure `target_table: silver.sales_invoice` with `column_map` to bypass bronze.
+
+---
+
+### Example Config: File-Based Testing (silver-direct, no bronze)
+
+This is the typical pattern for Indian SMB clients — data lands directly in silver, column-selected and renamed at extraction time. No bronze layer needed.
 
 ```yaml
 source:
@@ -724,17 +873,23 @@ schedule_tiers:
 tables:
   - name: sales_invoice
     source_table: sales_invoice.csv
-    target_table: bronze.sales_invoice
+    target_table: silver.sales_invoice   # lands directly in silver
     strategy: incremental
     timestamp_column: modified_date
     schedule: hot
     primary_key: [invoice_id]
+    column_map:                          # select + rename 10 of 150 columns
+      InvoiceID: invoice_id
+      CustCode: customer_code
+      InvDate: invoice_date
+      NetAmt: net_amount
+      ModifiedDate: modified_date
     quality_checks:
       not_null: [invoice_id, customer_code]
 
   - name: customer_master
     source_table: customers.csv
-    target_table: bronze.customer_master
+    target_table: silver.customer_master
     strategy: full
     schedule: cold
     primary_key: [customer_code]
@@ -743,7 +898,9 @@ tables:
       CustomerName: customer_name
 ```
 
-### Example Config: Production (SQL Server + MotherDuck)
+### Example Config: Production with Bronze (compliance / audit client)
+
+For clients requiring raw data preservation (audit trail, compliance). Bronze uses `append` strategy — rows accumulate, nothing is deleted. Silver views over bronze for canonical naming.
 
 ```yaml
 source:
@@ -769,13 +926,17 @@ schedule_tiers:
   cold: weekly
 
 alerts:
-  slack_webhook: "${SLACK_WEBHOOK_URL}"
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  smtp_user: "${ALERT_EMAIL_USER}"
+  smtp_password: "${ALERT_EMAIL_PASSWORD}"
+  alert_to: "operator@example.com"
 
 tables:
   - name: sales_invoice
     source_table: dbo.SALESINVOICE
-    target_table: bronze.sales_invoice
-    strategy: incremental
+    target_table: bronze.sales_invoice   # raw, all columns, append-only
+    strategy: append                     # insert only — full audit trail
     timestamp_column: ModifiedDate
     schedule: hot
     primary_key: [ID]
@@ -786,7 +947,7 @@ tables:
   - name: customer_master
     source_table: dbo.CUSTOMERMASTER
     target_table: bronze.customer_master
-    strategy: full
+    strategy: full                       # small reference table, swap ok
     checksum_columns: [customercode, customername, salestype, city, states]
     schedule: cold
     primary_key: [customercode]
@@ -795,9 +956,23 @@ tables:
       unique: [customercode]
 ```
 
+Silver views for the above would live in `transforms/silver/sales_invoice.sql`:
+```sql
+CREATE OR REPLACE VIEW silver.sales_invoice AS
+SELECT
+    ID          AS invoice_id,
+    SI_NO       AS invoice_no,
+    Custome_Code AS customer_code,
+    NetAmount   AS net_amount,
+    ModifiedDate AS modified_date,
+    _etl_loaded_at,
+    _etl_run_id
+FROM bronze.sales_invoice
+```
+
 ---
 
-## 6. Feature List for Implementation
+## 7. Feature List for Implementation
 
 Features ordered by dependency. Each feature is a self-contained unit suitable for `/spec` implementation.
 
@@ -812,7 +987,7 @@ Features ordered by dependency. Each feature is a self-contained unit suitable f
 | F5 | FileSource base + CSV source | FileSource base class (mtime+hash detection, DuckDB reader, incremental filter), CsvSource implementation | F2, F4 |
 | F6 | Additional file sources | DuckDBFileSource, SqliteSource, JsonSource, ExcelSource | F5 |
 | F7 | DatabaseSource base + SQL Server | DatabaseSource base class (cursor→Arrow, checksum detection), SqlServerSource (pyodbc, CHECKSUM_AGG) | F2, F4 |
-| F8 | DuckDB destination | DuckDBDestination: schema creation, swap pattern, partition overwrite, metadata columns, column_map | F2, F4 |
+| F8 | DuckDB destination | DuckDBDestination: schema creation, swap pattern, partition overwrite, append (insert-only), metadata columns, column_map | F2, F4 |
 | F9 | Core pipeline | `run_table()` wiring source + destination + state. `run_all()`. | F2, F3, F4, F5, F7, F8 |
 | F10 | CLI (basic) | `feather setup`, `feather run`, `feather status` | F9 |
 
@@ -822,7 +997,7 @@ Features ordered by dependency. Each feature is a self-contained unit suitable f
 |---|---------|-------------|-----------|
 | F11 | Data quality checks | Declarative DQ (not_null, unique, row_count), results to `_dq_results` | F9 |
 | F12 | Schema drift detection | Schema comparison via source.get_schema(), snapshots, change classification | F3, F5, F7 |
-| F13 | Alerting | Slack webhook, alert on failures/DQ/drift | F11, F12 |
+| F13 | Alerting | SMTP email (smtplib), [CRITICAL]/[WARNING]/[INFO] severities, no-op if unconfigured | F11, F12 |
 | F14 | Run history CLI | `feather history` command with filtering | F3, F10 |
 
 ### Phase 3: Transforms and Remote Sync
@@ -853,7 +1028,7 @@ Features ordered by dependency. Each feature is a self-contained unit suitable f
 
 ---
 
-## 7. Testing Strategy
+## 8. Testing Strategy
 
 ### Test Layers
 
@@ -913,21 +1088,21 @@ def duckdb_con():
 
 ---
 
-## 8. Open Questions
+## 9. Open Questions
 
 1. **MotherDuck region** — Where is the instance hosted? Latency from India matters.
 2. **ROWVERSION columns** — Do Icube ERP tables have SQL Server's ROWVERSION column?
-3. **Excel reader** — DuckDB's `st_read()` requires the `spatial` extension. Verify it handles `.xlsx` reliably, or use `openpyxl` as fallback.
+3. **Excel reader** — ~~DuckDB's `st_read()` requires the `spatial` extension.~~ **Resolved:** Use DuckDB's `excel` extension (`read_xlsx()`) for `.xlsx` files — it is a core extension, ships with DuckDB, and is more efficient than the spatial extension's incidental xlsx support (which may be removed). For `.xls` files, fall back to `openpyxl` (added as 8th dependency). Constraint: `.xls` fallback produces a warning in logs; `.xlsx` is the recommended format for all new source files.
 
 ---
 
-## 9. Deferred Ideas
+## 10. Deferred Ideas
 
 See `docs/research.md` section "Ideas Evaluated and Deferred to Later Stages" for 13 deferred ideas with revisit triggers.
 
 ---
 
-## 10. Reference
+## 11. Reference
 
 - Research: `docs/research.md` (7 agents synthesized)
 - Existing POC: `~/Desktop/NonDropBoxProjects/afans-reporting-dev/`
