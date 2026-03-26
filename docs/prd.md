@@ -1,6 +1,6 @@
 # feather-etl: Product Requirements Document
 
-**Version:** 1.3
+**Version:** 1.4
 **Date:** 2026-03-26
 **Status:** Draft
 
@@ -10,6 +10,7 @@
 | 1.1 | Source abstraction, file-based sources added |
 | 1.2 | NFR updates, connector interface design |
 | 1.3 | Excel reader corrected (read_xlsx + openpyxl); Slack replaced with SMTP email; bronze made optional; append strategy added; silver redefined as canonical mapping layer; connector/transform library roadmap added; schema drift behavior (Option B) defined; product scope clarified for multi-client deployment |
+| 1.4 | Out-of-scope section added (Section 3); NFR3 performance targets made concrete (file size + hardware baseline); NFR8 security added (credential redaction, file permissions, plain-text warning); NFR9 reliability added (state DB recovery, scheduler resilience); UC8 backfill, UC9 validate dry run, UC10 state recovery added; feather validate CLI command added to FR11 and F10 |
 
 ---
 
@@ -80,9 +81,39 @@ Operator adds a table entry to `feather.yaml`, optionally adds silver/gold SQL. 
 **UC7: Schema Change Detection**
 Source system changes columns. feather-etl detects drift via schema snapshot comparison, logs it, sends an email alert. Added columns are loaded automatically. Removed columns are loaded as NULL. Type changes attempt a cast; failures are quarantined with a critical alert.
 
+**UC8: Backfill / Re-extraction**
+A DQ issue is found in historical data, or a silver transform bug is discovered that requires re-deriving data from an earlier point. Operator resets the watermark for a table directly in `feather_state.duckdb` (`UPDATE _watermarks SET last_value = '2024-01-01' WHERE table_name = 'sales_invoice'`), then runs `feather run --table sales_invoice`. The pipeline re-extracts from the reset watermark. For `append` strategy tables, the operator also truncates or drops the target table before resetting the watermark. There is no CLI command for this in v1 — it is a manual state DB operation. `feather backfill` is deferred (see Section 3 out-of-scope).
+
+**UC9: Config Validation (Dry Run)**
+Operator has edited `feather.yaml` to add a new table or change schedules and wants to verify the config is valid before running. Runs `feather validate` — the system parses and validates the config, resolves all paths, checks that source files exist (for file-based sources), and prints a summary of what would run without executing anything. Exits with code 0 on success, non-zero with specific error messages on failure.
+
+**UC10: State DB Recovery**
+The `feather_state.duckdb` file is lost or corrupted (disk failure, accidental deletion). Operator runs `feather setup` — the system recreates the state DB from scratch with empty tables. All watermarks are lost; the next `feather run` treats every table as a first run and performs full re-extraction. For `incremental` tables this means re-extracting all history from the source; for `append` tables the operator should manually truncate the target table before running to avoid duplicates. The operator is informed of the reset via a `[WARNING]` log.
+
 ---
 
-## 3. Functional Requirements
+## 3. Out of Scope (v1)
+
+The following are explicitly not part of feather-etl v1. They are documented here to prevent scope creep and to give clear answers when clients or team members ask.
+
+| Out of scope | Notes |
+|---|---|
+| REST API / web UI for monitoring | Operators use `feather status`, `feather history`, and direct DuckDB queries. A web UI is a v3+ consideration. |
+| Multi-tenant support | Each client is a separate deployment with its own `feather.yaml`. There is no shared multi-tenant runtime. |
+| Support for destination types other than local DuckDB + MotherDuck | Snowflake, BigQuery, Redshift are not supported. The Destination Protocol makes adding them possible without core changes. |
+| Real-time / streaming ingestion | feather-etl is a batch pipeline. Minimum granularity is `hourly`. |
+| Automated schema evolution (ALTER TABLE beyond drift handling) | FR4.9 handles drift permissively at load time. There is no migration framework or schema versioning. |
+| Role-based access control | No user management, no permissions layer. Access is controlled at the OS/file level. |
+| Data lineage tracking beyond run metadata | `_runs` and `_run_steps` provide operational lineage. Column-level lineage is not tracked. |
+| dbt compatibility or SQL dialect translation | Transforms are plain DuckDB SQL. No dbt models, no Jinja, no cross-dialect support. |
+| Docker / Kubernetes deployment | feather-etl runs as a Python process. Containerisation is the operator's responsibility. |
+| Connector and canonical transform library | Planned for v2 as `feather-connectors`. See Section 5 for the roadmap. |
+| LLM agent interface for client analysts | Planned for v2+. v1 provides the data layer (silver/gold) that the agent interface will sit on top of. |
+| Backfill / historical re-extraction via CLI flag | Operators can reset a watermark directly in `feather_state.duckdb` to trigger re-extraction. A `feather backfill` command is deferred. |
+
+---
+
+## 4. Functional Requirements
 
 ### FR1: Source Abstraction
 
@@ -828,6 +859,7 @@ Single entry point `feather`, built with typer. Every operational action is a CL
 | `feather status` | Show watermarks and last run status |
 | `feather history [--table X]` | Show run history |
 | `feather schedule` | Start APScheduler daemon |
+| `feather validate` | Parse and validate config, resolve paths, print summary — no execution |
 
 #### Requirements
 
@@ -976,7 +1008,7 @@ THE SYSTEM SHALL continue running all other configured tables
 
 ---
 
-## 4. Non-Functional Requirements
+## 5. Non-Functional Requirements
 
 **NFR1: Dependencies.** All 7 runtime dependencies ship with the package:
 
@@ -994,7 +1026,12 @@ Alerting uses Python stdlib `smtplib` — no extra dependency. The package is co
 
 **NFR2: Code Size.** Core package under 1,210 lines of Python (increased from 1,000 to accommodate source abstraction; +10 for openpyxl Excel fallback).
 
-**NFR3: Performance.** Full extraction of ~700K rows within 5 minutes. Incremental extraction of ~1,000 rows within 10 seconds. File-based extraction within seconds regardless of size (DuckDB native readers are fast).
+**NFR3: Performance.** Targets measured on a mid-range developer laptop (Apple M-series or equivalent Intel, SSD, 16 GB RAM):
+- SQL Server full extraction: ~700K rows within 5 minutes over a local network connection
+- SQL Server incremental extraction: ~1,000 rows within 10 seconds
+- File-based extraction (CSV/DuckDB/SQLite): files up to 500 MB within 30 seconds (DuckDB native columnar readers)
+- File-based extraction (Excel via read_xlsx): files up to 50 MB within 30 seconds
+- Gold table rebuild: all gold transforms complete within 60 seconds for a typical client deployment (≤20 tables, ≤5M total rows in silver)
 
 **NFR4: Project Tooling.** Use `uv` for dependency management.
 
@@ -1002,11 +1039,22 @@ Alerting uses Python stdlib `smtplib` — no extra dependency. The package is co
 
 **NFR6: Testing.** End-to-end tests use file-based sources (CSV, DuckDB files) → local DuckDB. No mocking needed for core pipeline tests. Only SQL Server and MotherDuck connectivity require mocking. Target: 80% coverage.
 
-**NFR7: Logging.** Python stdlib `logging` — console (human-readable) + JSONL file (structured, queryable).
+**NFR7: Logging.** Python stdlib `logging` — console (human-readable) + JSONL file (structured, queryable). Structured JSONL fields per log entry: `timestamp`, `level`, `table_name`, `run_id`, `step`, `message`. Log file rotates at 10 MB, retains last 5 files.
+
+**NFR8: Security.**
+- **Credentials never in plain text.** Connection strings, SMTP passwords, and MotherDuck tokens must use `${ENV_VAR}` substitution in `feather.yaml`. If a config value for a known secret field (e.g. `smtp_password`, `token`, `connection_string`) is not an env var reference, the system shall log a `[WARNING]` at startup and proceed — it does not fail, as some dev environments use plain-text values intentionally.
+- **Credential redaction in logs.** Connection strings and tokens shall never appear in log output or in `_runs.error_message`. If an exception message contains a connection string (pyodbc errors often do), it shall be redacted to `[REDACTED]` before logging.
+- **State DB file permissions.** On creation, `feather_state.duckdb` and `feather_data.duckdb` shall be created with `600` permissions (owner read/write only) on Unix systems. No enforcement on Windows.
+- **No network listening.** feather-etl does not open any network ports. The APScheduler daemon (`feather schedule`) is a local process only.
+
+**NFR9: Reliability.**
+- A single table failure shall never crash the process — all other tables continue running (enforced by FR13.4).
+- If `feather_state.duckdb` is corrupted or missing, `feather setup` shall recreate it from scratch. Watermarks are lost; the next run performs a full re-extraction for all tables. The operator is informed via a `[WARNING]` log at startup.
+- `feather schedule` (APScheduler daemon) shall handle unexpected exceptions in individual job executions without terminating the scheduler process.
 
 ---
 
-## 5. Connector Interface Design
+## 6. Connector Interface Design
 
 ### Design Decision: Reimplement dlt Patterns, Not Reuse dlt
 
@@ -1194,7 +1242,7 @@ This is explicitly out of scope for v1. The v1 Protocol-based architecture is de
 
 ---
 
-## 6. Architecture
+## 7. Architecture
 
 ### Data Flow
 
@@ -1450,7 +1498,7 @@ FROM bronze.sales_invoice
 
 ---
 
-## 7. Feature List for Implementation
+## 8. Feature List for Implementation
 
 Features ordered by dependency. Each feature is a self-contained unit suitable for `/spec` implementation.
 
@@ -1467,7 +1515,7 @@ Features ordered by dependency. Each feature is a self-contained unit suitable f
 | F7 | DatabaseSource base + SQL Server | DatabaseSource base class (cursor→Arrow, checksum detection), SqlServerSource (pyodbc, CHECKSUM_AGG) | F2, F4 |
 | F8 | DuckDB destination | DuckDBDestination: schema creation, swap pattern, partition overwrite, append (insert-only), metadata columns, column_map | F2, F4 |
 | F9 | Core pipeline | `run_table()` wiring source + destination + state. `run_all()`. | F2, F3, F4, F5, F7, F8 |
-| F10 | CLI (basic) | `feather setup`, `feather run`, `feather status` | F9 |
+| F10 | CLI (basic) | `feather setup`, `feather run`, `feather status`, `feather validate` | F9 |
 
 ### Phase 2: Observability
 
@@ -1506,7 +1554,7 @@ Features ordered by dependency. Each feature is a self-contained unit suitable f
 
 ---
 
-## 8. Testing Strategy
+## 9. Testing Strategy
 
 ### Test Layers
 
@@ -1524,7 +1572,8 @@ test_data/
 ```
 
 Tests create a `feather.yaml` pointing to these files, run the full pipeline, and verify:
-- Bronze tables populated correctly in output DuckDB
+- Silver tables populated correctly in output DuckDB (silver-direct config, no bronze)
+- Bronze tables populated correctly when configured (bronze-cache config)
 - State updated (watermarks, run history)
 - DQ checks executed and results recorded
 - Schema drift detected when test files are modified
@@ -1566,7 +1615,7 @@ def duckdb_con():
 
 ---
 
-## 9. Open Questions
+## 10. Open Questions
 
 1. **MotherDuck region** — Where is the instance hosted? Latency from India matters.
 2. **ROWVERSION columns** — Do Icube ERP tables have SQL Server's ROWVERSION column?
@@ -1574,13 +1623,13 @@ def duckdb_con():
 
 ---
 
-## 10. Deferred Ideas
+## 11. Deferred Ideas
 
 See `docs/research.md` section "Ideas Evaluated and Deferred to Later Stages" for 13 deferred ideas with revisit triggers.
 
 ---
 
-## 11. Reference
+## 12. Reference
 
 - Research: `docs/research.md` (7 agents synthesized)
 - Existing POC: `~/Desktop/NonDropBoxProjects/afans-reporting-dev/`
