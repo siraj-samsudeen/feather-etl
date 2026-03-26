@@ -6,6 +6,7 @@ Approved: Yes
 Iterations: 1
 Worktree: Yes
 Type: Feature
+Review: [docs/reviews/2026-03-26-slice1-review.md](../reviews/2026-03-26-slice1-review.md)
 
 ## Summary
 
