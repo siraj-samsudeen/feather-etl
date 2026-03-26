@@ -1,6 +1,6 @@
 # feather-etl: Product Requirements Document
 
-**Version:** 1.5
+**Version:** 1.6
 **Date:** 2026-03-26
 **Status:** Draft
 
@@ -12,6 +12,7 @@
 | 1.3 | Excel reader corrected (read_xlsx + openpyxl); Slack replaced with SMTP email; bronze made optional; append strategy added; silver redefined as canonical mapping layer; connector/transform library roadmap added; schema drift behavior (Option B) defined; product scope clarified for multi-client deployment |
 | 1.4 | Out-of-scope section added (Section 3); NFR3 performance targets made concrete (file size + hardware baseline); NFR8 security added (credential redaction, file permissions, plain-text warning); NFR9 reliability added (state DB recovery, scheduler resilience); UC8 backfill, UC9 validate dry run, UC10 state recovery added; feather validate CLI command added to FR11 and F10 |
 | 1.5 | Product vision updated to reflect multi-client deployment product, not solo-operator tool; "What It Replaces" reframed for client deployments; Why section expanded for target audience; UC8/UC10 trimmed to use-case summaries; research.md context note and product vision updated to match |
+| 1.6 | feather-etl defined as package-only (no client config in this repo); client projects are separate GitHub repos per client; canonical client project layout defined; feather init wizard added (scaffolding + interactive + --non-interactive agent mode); --json output contract added to all CLI commands; FR11.12-15 EARS added; F10a (feather init) and F10b (--json mode) added to feature list; init_wizard.py added to module breakdown; NFR2 code size updated |
 
 ---
 
@@ -181,8 +182,12 @@ WHEN file hash has changed
 THE SYSTEM SHALL extract the file (full refresh or incremental depending on strategy).
 
 # FR1.7
-THE SYSTEM SHALL use CHECKSUM_AGG + COUNT(*) for change detection
-on SQL Server full-strategy tables, and timestamp watermarks for incremental tables.
+THE SYSTEM SHALL use BOTH CHECKSUM_AGG(BINARY_CHECKSUM(*)) AND COUNT(*)
+for change detection on SQL Server full-strategy tables.
+A change is detected if EITHER value differs from the stored value.
+Using COUNT alone misses data changes that preserve row count.
+Using CHECKSUM alone has a collision risk (~25% of changes undetected for
+consecutive similar values per research). Both together is the safe minimum.
 
 # FR1.8
 THE SYSTEM SHALL return data as PyArrow Tables from all source types to the loader.
@@ -213,6 +218,11 @@ WHERE {timestamp_column} >= {effective_watermark} ORDER BY {timestamp_column}.
 ### FR2: Configuration
 
 One YAML file (`feather.yaml`) defines everything: source connection, destination, tables, schedules, alerts, and defaults. One file per client project. The goal is reproducible deployments — an operator can copy a `feather.yaml` to a new machine, set environment variables, and run. No Python code, no programmatic configuration, no hidden state.
+
+For clients with many tables (20-30 is common for ERP deployments), a single `tables:` list becomes unwieldy. The system supports splitting table definitions into a `tables/` directory alongside `feather.yaml`. Each `.yaml` file in the directory defines one or more tables; the system merges them all at load time.
+
+> **Decision: directory-based table config for multi-table clients.**
+> A `tables/` split keeps each domain manageable (`tables/sales.yaml`, `tables/inventory.yaml`, `tables/hr.yaml`) and allows different team members to own different files without merge conflicts on the root config. If both a `tables:` list in `feather.yaml` and a `tables/` directory are present, both are merged with the explicit list taking precedence on name conflicts.
 
 ```yaml
 source:
@@ -273,7 +283,14 @@ schedule_tiers:
 
 ```
 # FR2.1
-THE SYSTEM SHALL be configured via a single YAML file (feather.yaml).
+THE SYSTEM SHALL be configured via a feather.yaml file containing source,
+destination, schedule_tiers, alerts, defaults, and optionally tables.
+
+# FR2.1b
+IF a tables/ directory exists alongside feather.yaml
+THE SYSTEM SHALL load all .yaml files in that directory and merge their
+table definitions with any tables defined in feather.yaml.
+On name conflict, the feather.yaml definition takes precedence.
 
 # FR2.2
 WHEN the config contains ${VAR_NAME} syntax
@@ -506,7 +523,9 @@ send a [CRITICAL] email alert, and mark the run as partial_success.
 
 ### FR5: Transforms
 
-Transforms follow a two-layer model. Silver is the canonical mapping layer — it normalises source-system-specific naming into a standard shape that client analysts and LLM agents work against. Gold is the materialisation layer — client-specific KPIs, aggregations, and denormalized tables shaped for dashboards. Silver transforms are views (cheap, always reflect current data), gold transforms are materialised tables (rebuilt after each extraction so dashboards see fresh data).
+Transforms follow a two-layer model. Silver is the canonical mapping layer — it normalises source-system-specific naming into a standard shape that client analysts and LLM agents work against. Gold is the output layer — client-specific KPIs, aggregations, and denormalized tables shaped for dashboards.
+
+Silver transforms are always views — they are lazy, always reflect current data, and add no pipeline step. Gold transforms are views by default but can be materialised tables when dashboard performance requires it. Materialised gold tables are rebuilt after each extraction run; gold views are not (they are always live). The operator controls this per transform via a `-- materialized: true` comment in the SQL file.
 
 > **Decision: silver is the canonical mapping layer.**
 > Silver is where source-system-specific naming, column selection, and light cleaning happen. A SAP B1 table `ORDR` and a custom ERP table `SalesHeader` both become `silver.sales_order` with the same 10-15 columns in the same shape. Client analysts and LLM agents work against silver, not bronze. This is also the layer where the planned connector/transform library (v2) will provide reusable canonical mappings per source system — so the operator deploying a second SAP B1 client can reuse the silver transforms from the first.
@@ -523,7 +542,10 @@ THE SYSTEM SHALL execute silver transforms as DuckDB views
 (CREATE OR REPLACE VIEW).
 
 # FR5.3
-THE SYSTEM SHALL execute gold transforms as DuckDB materialized tables
+THE SYSTEM SHALL execute gold transforms as DuckDB views by default
+(CREATE OR REPLACE VIEW).
+IF a gold transform SQL file contains the comment -- materialized: true
+THEN THE SYSTEM SHALL execute it as a materialized table
 (CREATE OR REPLACE TABLE ... AS SELECT ...).
 
 # FR5.4
@@ -533,6 +555,12 @@ in SQL files.
 # FR5.5
 THE SYSTEM SHALL determine transform execution order via
 graphlib.TopologicalSorter (stdlib) based on declared dependencies.
+Dependencies are declared via SQL comment in the transform file:
+-- depends_on: silver.sales_invoice
+Multiple dependencies are declared on separate lines.
+The system SHALL parse these comments at setup time to build the dependency graph.
+IF a declared dependency does not resolve to a known transform
+THE SYSTEM SHALL raise an error at setup time naming the missing dependency.
 
 # FR5.6
 WHEN feather setup runs
@@ -540,7 +568,8 @@ THE SYSTEM SHALL execute all transform SQL files.
 
 # FR5.7
 WHEN an extraction run completes successfully
-THE SYSTEM SHALL rebuild all gold tables (rematerialize).
+THE SYSTEM SHALL rebuild only gold transforms marked -- materialized: true.
+Gold views are not rebuilt (they are always live).
 ```
 
 #### Acceptance Criteria
@@ -548,6 +577,10 @@ THE SYSTEM SHALL rebuild all gold tables (rematerialize).
 **AC-FR5.a:** Given silver and gold transforms with a dependency chain (gold depends on silver), when `feather setup` runs, then silver views are created before gold tables — verified by gold table containing correct data from silver.
 
 **AC-FR5.b:** Given a gold transform referencing `${schema}` and a template variable `schema=silver`, when the transform executes, then the substitution resolves correctly in the generated SQL.
+
+**AC-FR5.c:** Given a gold transform with `-- depends_on: silver.sales_invoice` and a silver transform for `sales_invoice`, when `feather setup` runs, then the silver view is created before the gold transform — verified by gold containing correct data.
+
+**AC-FR5.d:** Given a gold transform with `-- materialized: true`, when a run completes, then it is rebuilt as a `CREATE OR REPLACE TABLE`. A gold transform without that comment is executed as `CREATE OR REPLACE VIEW` and is NOT rebuilt after each run.
 
 ### FR6: Remote Sync (Optional)
 
@@ -656,6 +689,19 @@ THE SYSTEM SHALL skip those rows (boundary deduplication).
 **AC-FR7.c:** Given a table with `retry_count: 2`, when the pipeline runs successfully, then `retry_count` is reset to 0 and `retry_after` is cleared.
 
 ### State Schema Reference
+
+**`_state_meta`** — state database version tracking:
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| schema_version | INTEGER PK | Current state schema version |
+| created_at | TIMESTAMP | When this version was initialised |
+| feather_version | VARCHAR | feather-etl package version that created/migrated this state |
+
+`feather setup` writes a row with the current schema version on first run. On subsequent runs it reads this version and applies any pending migrations before proceeding. If the state DB was created by an older feather-etl version, `feather setup` migrates it forward automatically. If the state DB version is newer than the running feather-etl version, the system raises an error and refuses to run (downgrade protection).
+
+> **Decision: version the state schema from day one.**
+> State schema migrations are the most common source of upgrade pain in ETL tools. Adding `_state_meta` now costs one table and ~20 lines of migration code. Not adding it means the first schema change requires manual state DB deletion and full re-extraction across all client deployments — which is operationally unacceptable at multi-client scale.
 
 **`_watermarks`** — per-table extraction state:
 
@@ -841,6 +887,12 @@ table schedule → tier lookup → named schedule → cron kwargs.
 WHEN feather run --tier is invoked
 THE SYSTEM SHALL execute a one-shot run of all tables matching that tier,
 then exit (suitable for OS cron).
+
+# FR10.5
+THE SYSTEM SHALL contain no pipeline logic in the scheduler or CLI layers.
+The scheduler SHALL call run_table() (the core pipeline function).
+The CLI SHALL call run_table() (the same function).
+Pipeline logic lives in pipeline.py only — scheduler and CLI are thin wrappers.
 ```
 
 #### Acceptance Criteria
@@ -855,6 +907,7 @@ Single entry point `feather`, built with typer. Every operational action is a CL
 
 | Command | Purpose |
 |---------|---------|
+| `feather init` | Scaffold a new client project and run the setup wizard |
 | `feather setup` | Init state DB, create schemas, apply transforms |
 | `feather run` | Run all tables |
 | `feather run --table X` | Run single table |
@@ -863,6 +916,7 @@ Single entry point `feather`, built with typer. Every operational action is a CL
 | `feather history [--table X]` | Show run history |
 | `feather schedule` | Start APScheduler daemon |
 | `feather validate` | Parse and validate config, resolve paths, print summary — no execution |
+| `feather discover` | List all tables available in the configured source with columns and inferred types |
 
 #### Requirements
 
@@ -900,6 +954,43 @@ THE SYSTEM SHALL start the APScheduler daemon.
 
 # FR11.9
 THE SYSTEM SHALL accept --config PATH on all commands (default: feather.yaml).
+
+# FR11.10
+WHEN feather validate is invoked
+THE SYSTEM SHALL parse and validate feather.yaml, resolve all paths,
+check source file existence for file-based sources, and print a summary.
+THE SYSTEM SHALL exit with code 0 on success, non-zero on validation failure.
+
+# FR11.11
+WHEN feather discover is invoked
+THE SYSTEM SHALL call source.discover() and print all available tables,
+their columns, inferred data types, and inferred primary keys.
+This is a read-only operation — no data is extracted or loaded.
+
+# FR11.12
+WHEN feather init is invoked
+THE SYSTEM SHALL scaffold a new client project directory containing:
+feather.yaml (with placeholders), pyproject.toml, .gitignore,
+.env.example, transforms/silver/, transforms/gold/, tables/, extracts/.
+
+# FR11.13
+WHEN feather init is invoked interactively
+THE SYSTEM SHALL prompt for: project name, source type, connection details,
+then run discover() to list available tables, then prompt for table selection,
+then generate feather.yaml and silver transform stubs for selected tables,
+then run validate to confirm the generated config is valid.
+
+# FR11.14
+WHEN feather init is invoked with --non-interactive
+THE SYSTEM SHALL accept all inputs as CLI flags or a JSON config file,
+complete scaffolding without any prompts, and exit with a machine-readable
+JSON summary of files created and validation result.
+
+# FR11.15 — Agent-friendly output contract
+WHEN any feather command is invoked with --json
+THE SYSTEM SHALL emit all output as newline-delimited JSON to stdout
+with no human-readable formatting, suitable for parsing by an LLM agent.
+Exit codes: 0 = success, 1 = validation/config error, 2 = runtime error.
 ```
 
 #### Acceptance Criteria
@@ -907,6 +998,10 @@ THE SYSTEM SHALL accept --config PATH on all commands (default: feather.yaml).
 **AC-FR11.a:** Given a valid `feather.yaml` at a non-default path `/opt/client/config.yaml`, when `feather run --config /opt/client/config.yaml` is invoked, then the pipeline runs using that config file.
 
 **AC-FR11.b:** Given 5 tables configured with 2 in tier `hot`, when `feather run --tier hot` is invoked, then only the 2 hot-tier tables are executed.
+
+**AC-FR11.c:** Given `feather init --non-interactive --source sqlserver --name client-abc --connection-string "${SQL_SERVER_CONNECTION_STRING}"` is invoked, then a complete project directory is created with valid `feather.yaml`, no prompts are shown, and the command exits with code 0 and a JSON summary of files created.
+
+**AC-FR11.d:** Given `feather status --json` is invoked, then stdout contains one JSON object per table (newline-delimited), each with `table_name`, `last_run_at`, `status`, `watermark`, and `rows_loaded` fields — no human-readable text.
 
 ### FR12: Alerting
 
@@ -1027,7 +1122,7 @@ THE SYSTEM SHALL continue running all other configured tables
 
 Alerting uses Python stdlib `smtplib` — no extra dependency. The package is complete out of the box — all source types, scheduling, and alerting are included.
 
-**NFR2: Code Size.** Core package under 1,210 lines of Python (increased from 1,000 to accommodate source abstraction; +10 for openpyxl Excel fallback).
+**NFR2: Code Size.** Core package under 1,400 lines of Python. The init wizard (`init_wizard.py`, ~120 LOC) and `--json` output mode add to the original 1,210 LOC target. Complexity budget is intentional — the wizard is a first-class feature, not an afterthought.
 
 **NFR3: Performance.** Targets measured on a mid-range developer laptop (Apple M-series or equivalent Intel, SSD, 16 GB RAM):
 - SQL Server full extraction: ~700K rows within 5 minutes over a local network connection
@@ -1321,10 +1416,75 @@ src/feather/
 ├── alerts.py                   ~40 LOC   SMTP email alerts (smtplib)
 ├── pipeline.py                ~150 LOC   run_table() orchestrator
 ├── scheduler.py                ~80 LOC   APScheduler + presets
-└── cli.py                      ~80 LOC   typer CLI
+├── cli.py                      ~80 LOC   typer CLI (thin wrapper — no pipeline logic)
+└── init_wizard.py             ~120 LOC   feather init — scaffolding + interactive wizard
                                --------
-                              ~1200 LOC
+                              ~1330 LOC
 ```
+
+### Package vs Client Project — Separation of Concerns
+
+**feather-etl is a Python package only.** This repository contains no client configuration, no client transforms, and no client data. It is published and installed as a dependency.
+
+Each client lives in its own **separate GitHub repository**, scaffolded via `feather init`. The client project depends on feather-etl as a package:
+
+```toml
+# client project pyproject.toml
+[project]
+dependencies = ["feather-etl>=1.0"]
+```
+
+### Canonical Client Project Layout
+
+`feather init` generates this structure in a new directory:
+
+```
+client-abc/                         # one GitHub repo per client
+├── .gitignore                      # excludes *.duckdb, .env
+├── pyproject.toml                  # depends on feather-etl
+├── feather.yaml                    # source, destination, sync, schedules, alerts
+├── tables/                         # optional — split by domain
+│   ├── sales.yaml
+│   ├── inventory.yaml
+│   └── hr.yaml
+├── transforms/
+│   ├── silver/                     # canonical mapping views
+│   │   ├── sales_invoice.sql       # -- depends_on: (none)
+│   │   └── customer_master.sql
+│   └── gold/                       # client-specific output
+│       ├── sales_summary.sql       # -- materialized: true
+│       └── customer_dashboard.sql  # view (default)
+└── extracts/                       # optional — custom source SELECT queries
+    └── sales_invoice.sql           # overrides SELECT * for this table
+```
+
+State (`feather_state.duckdb`) and data (`feather_data.duckdb`) are created at runtime alongside `feather.yaml`, gitignored. Everything else — YAML, SQL — is version controlled.
+
+> **Decision: one repo per client, not a monorepo.**
+> A monorepo of client configs creates cross-client coupling — one misconfigured YAML can block another client's pipeline, secrets from different clients live in the same repo, and client-side analysts cannot be given repo access without exposing other clients' data. Separate repos give clean isolation, per-client CI, and the ability to grant the client's own analyst read access to their transforms.
+
+### `feather init` — Scaffolding and Setup Wizard
+
+`feather init` scaffolds a new client project and optionally runs an agent-friendly setup wizard. It is the entry point for all new client onboarding.
+
+The wizard flow:
+```
+feather init
+  → prompt: project name / client name
+  → prompt: source type (sqlserver / sap_b1 / csv / etc.)
+  → prompt: connection details (or ${ENV_VAR} references)
+  → run feather discover (connect to source, list available tables)
+  → prompt: which tables to include (human or agent selects)
+  → generate: feather.yaml with selected tables, placeholder column_maps
+  → generate: transforms/silver/*.sql stubs for each selected table
+  → generate: .gitignore, pyproject.toml, .env.example
+  → run feather validate (confirm config is valid before finishing)
+  → print: next steps
+```
+
+All prompts support `--non-interactive` flag with values passed as CLI arguments or JSON — so an LLM agent can drive the entire workflow programmatically without human keystrokes.
+
+The `feather-connectors` library (v2) plugs into `feather init` — when a connector exists for the selected source type (e.g. SAP B1), the wizard uses it to pre-populate table names, primary keys, timestamp columns, and silver transform stubs rather than generating empty placeholders.
 
 ### Core Pipeline Flow (`run_table`)
 
@@ -1518,7 +1678,9 @@ Features ordered by dependency. Each feature is a self-contained unit suitable f
 | F7 | DatabaseSource base + SQL Server | DatabaseSource base class (cursor→Arrow, checksum detection), SqlServerSource (pyodbc, CHECKSUM_AGG) | F2, F4 |
 | F8 | DuckDB destination | DuckDBDestination: schema creation, swap pattern, partition overwrite, append (insert-only), metadata columns, column_map | F2, F4 |
 | F9 | Core pipeline | `run_table()` wiring source + destination + state. `run_all()`. | F2, F3, F4, F5, F7, F8 |
-| F10 | CLI (basic) | `feather setup`, `feather run`, `feather status`, `feather validate` | F9 |
+| F10 | CLI (basic) | `feather setup`, `feather run`, `feather status`, `feather validate`, `feather discover` | F9 |
+| F10a | `feather init` wizard | Project scaffolding, interactive + `--non-interactive` mode, discover-driven table selection, silver stub generation, validate on completion | F2, F4, F10 |
+| F10b | `--json` output mode | Machine-readable NDJSON output for all commands — LLM agent interface | F10 |
 
 ### Phase 2: Observability
 
@@ -1534,7 +1696,7 @@ Features ordered by dependency. Each feature is a self-contained unit suitable f
 | # | Feature | Description | Depends On |
 |---|---------|-------------|-----------|
 | F15 | Silver views | Transform SQL files, `string.Template` substitution, view creation | F8 |
-| F16 | Gold materialized tables | Materialized transforms, topological ordering, rebuild after load | F15 |
+| F16 | Gold transforms | Gold as view (default) or materialized table (-- materialized: true), topological ordering, rebuild materialized tables after load | F15 |
 | F17 | Remote sync (MotherDuck) | Optional ATTACH + push gold tables via destination.sync_to_remote() | F16 |
 
 ### Phase 4: Scheduling
