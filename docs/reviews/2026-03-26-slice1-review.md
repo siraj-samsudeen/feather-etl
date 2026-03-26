@@ -4,6 +4,40 @@ Created: 2026-03-26
 Slice: 1 (foundation)
 Plan: [docs/plans/2026-03-26-slice1-foundation.md](../plans/2026-03-26-slice1-foundation.md)
 Commit: 869a372
+Status: OPEN — fixes not yet started
+
+---
+
+## Document conventions
+
+This file is a **permanent record** of what was found at the time of review.
+**Do not edit findings or mark them resolved here.**  Instead:
+
+1. **Fixing agent** creates `docs/plans/YYYY-MM-DD-slice1-fixes.md` — a normal
+   plan doc scoping which findings to address, any design decisions made, and
+   autonomous choices.  Link it back here with `Review: <this file>`.
+
+2. **Fixing agent** graduates `TestKnownBugs` tests as described in the
+   "When fixing a bug" section below, and updates `scripts/hands_on_test.sh`
+   BUG-labelled checks to assert the corrected behaviour.
+
+3. **After fixes are merged**, update the `Status:` line in this file's header
+   to `RESOLVED — see docs/plans/YYYY-MM-DD-slice1-fixes.md` and nothing else.
+
+4. **Reviewing agent** (the human asks for a re-review) creates a new file
+   `docs/reviews/YYYY-MM-DD-slice1-review-2.md` covering what changed, what
+   was fixed correctly, what is still open, and any new issues introduced.
+   It links back to this file as `Prior review:`.
+
+This gives a clean chain:
+```
+review-1 (this file)
+  └── fixes-plan
+        └── review-2
+              └── fixes-plan-2  ...
+```
+
+---
 
 ## What was reviewed
 
