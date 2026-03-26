@@ -106,6 +106,14 @@ class TestDuckDBFileSource:
         assert result.changed is True
         assert result.reason == "first_run"
 
+    def test_check_corrupt_file_returns_false(self, tmp_path: Path):
+        from feather.sources.duckdb_file import DuckDBFileSource
+
+        bad_file = tmp_path / "corrupt.duckdb"
+        bad_file.write_bytes(b"this is not a valid duckdb file")
+        source = DuckDBFileSource(path=bad_file)
+        assert source.check() is False
+
 
 class TestSourceRegistry:
     def test_registry_resolves_duckdb(self):
@@ -121,3 +129,11 @@ class TestSourceRegistry:
         cfg = SourceConfig(type="duckdb", path=client_db)
         source = create_source(cfg)
         assert source.check() is True
+
+    def test_create_source_unknown_type(self):
+        from feather.config import SourceConfig
+        from feather.sources.registry import create_source
+
+        cfg = SourceConfig(type="cassandra", path=None)
+        with pytest.raises(ValueError, match="not implemented"):
+            create_source(cfg)

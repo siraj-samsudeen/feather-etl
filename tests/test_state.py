@@ -1,7 +1,10 @@
 """Tests for feather.state module."""
 
+import os
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import duckdb
 import pytest
@@ -58,6 +61,37 @@ class TestStateInit:
         count = con.execute("SELECT COUNT(*) FROM _state_meta").fetchone()[0]
         con.close()
         assert count == 1
+
+
+    def test_downgrade_protection(self, tmp_path: Path):
+        from feather.state import StateManager
+
+        sm = StateManager(tmp_path / "state.duckdb")
+        sm.init_state()
+
+        # Simulate a future version writing version=99
+        con = duckdb.connect(str(sm.path))
+        con.execute("UPDATE _state_meta SET schema_version = 99")
+        con.close()
+
+        with pytest.raises(RuntimeError, match="newer than feather-etl"):
+            sm.init_state()
+
+    def test_new_state_db_gets_600_permissions(self, tmp_path: Path):
+        from feather.state import StateManager
+
+        sm = StateManager(tmp_path / "state.duckdb")
+        sm.init_state()
+        mode = stat.S_IMODE(os.stat(sm.path).st_mode)
+        assert mode == 0o600
+
+    def test_chmod_oserror_is_swallowed(self, tmp_path: Path):
+        from feather.state import StateManager
+
+        sm = StateManager(tmp_path / "state.duckdb")
+        with patch("feather.state.os.chmod", side_effect=OSError("denied")):
+            sm.init_state()  # should not raise
+        assert sm.path.exists()
 
 
 class TestWatermarks:

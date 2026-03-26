@@ -52,6 +52,16 @@ class TestInit:
         assert (project / "tables").is_dir()
         assert (project / "extracts").is_dir()
 
+    def test_init_nonempty_dir_fails(self, tmp_path: Path):
+        from feather.cli import app
+
+        project = tmp_path / "existing"
+        project.mkdir()
+        (project / "somefile.txt").write_text("exists")
+        result = runner.invoke(app, ["init", str(project)])
+        assert result.exit_code != 0
+        assert "already exists" in result.output
+
 
 class TestValidate:
     def test_valid_config(self, cli_env: tuple[Path, Path]):
@@ -85,6 +95,21 @@ class TestDiscover:
         assert "SALESINVOICE" in result.output
         assert "CUSTOMERMASTER" in result.output
 
+    def test_discover_bad_source_fails(self, tmp_path: Path):
+        from feather.cli import app
+
+        db = tmp_path / "empty.duckdb"
+        db.write_bytes(b"not a duckdb file")
+        config = {
+            "source": {"type": "duckdb", "path": str(db)},
+            "destination": {"path": str(tmp_path / "data.duckdb")},
+            "tables": [{"name": "t", "source_table": "main.t", "target_table": "bronze.t", "strategy": "full"}],
+        }
+        (tmp_path / "feather.yaml").write_text(yaml.dump(config))
+        result = runner.invoke(app, ["discover", "--config", str(tmp_path / "feather.yaml")])
+        assert result.exit_code != 0
+        assert "Source connection failed" in result.output
+
 
 class TestSetup:
     def test_creates_state_and_schemas(self, cli_env: tuple[Path, Path]):
@@ -105,6 +130,23 @@ class TestRun:
         assert result.exit_code == 0
         assert "success" in result.output.lower()
 
+    def test_run_with_bad_table_shows_failure(self, tmp_path: Path):
+        from feather.cli import app
+
+        client_db = tmp_path / "client.duckdb"
+        shutil.copy2(FIXTURES_DIR / "client.duckdb", client_db)
+        config = {
+            "source": {"type": "duckdb", "path": str(client_db)},
+            "destination": {"path": str(tmp_path / "feather_data.duckdb")},
+            "tables": [
+                {"name": "bad_table", "source_table": "icube.NONEXISTENT", "target_table": "bronze.bad_table", "strategy": "full"},
+            ],
+        }
+        (tmp_path / "feather.yaml").write_text(yaml.dump(config))
+        result = runner.invoke(app, ["run", "--config", str(tmp_path / "feather.yaml")])
+        assert result.exit_code == 0  # pipeline continues even on failure
+        assert "failure" in result.output.lower()
+
 
 class TestStatus:
     def test_shows_status_after_run(self, cli_env: tuple[Path, Path]):
@@ -115,3 +157,21 @@ class TestStatus:
         result = runner.invoke(app, ["status", "--config", str(config_path)])
         assert result.exit_code == 0
         assert "inventory_group" in result.output
+
+    def test_status_no_state_db(self, cli_env: tuple[Path, Path]):
+        from feather.cli import app
+
+        config_path, _ = cli_env
+        result = runner.invoke(app, ["status", "--config", str(config_path)])
+        assert result.exit_code != 0
+        assert "No state DB found" in result.output
+
+    def test_status_no_runs_yet(self, cli_env: tuple[Path, Path]):
+        from feather.cli import app
+
+        config_path, _ = cli_env
+        # setup creates state DB but no runs yet
+        runner.invoke(app, ["setup", "--config", str(config_path)])
+        result = runner.invoke(app, ["status", "--config", str(config_path)])
+        assert result.exit_code == 0
+        assert "No runs recorded" in result.output

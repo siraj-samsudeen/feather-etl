@@ -1,6 +1,9 @@
 """Tests for feather.destinations module."""
 
+import os
+import stat
 from pathlib import Path
+from unittest.mock import patch
 
 import duckdb
 import pyarrow as pa
@@ -91,3 +94,31 @@ class TestDuckDBDestination:
         con.close()
         assert count == 5  # replaced, not appended
         assert run_id == "run_2"
+
+    def test_new_db_gets_600_permissions(self, tmp_path: Path):
+        from feather.destinations.duckdb import DuckDBDestination
+
+        db_path = tmp_path / "new_data.duckdb"
+        dest = DuckDBDestination(path=db_path)
+        dest.setup_schemas()
+        mode = stat.S_IMODE(os.stat(db_path).st_mode)
+        assert mode == 0o600
+
+    def test_chmod_oserror_is_swallowed(self, tmp_path: Path):
+        from feather.destinations.duckdb import DuckDBDestination
+
+        db_path = tmp_path / "data.duckdb"
+        dest = DuckDBDestination(path=db_path)
+        with patch("feather.destinations.duckdb.os.chmod", side_effect=OSError("denied")):
+            dest.setup_schemas()  # should not raise
+        assert db_path.exists()
+
+    def test_load_full_rollback_on_error(self, tmp_path: Path):
+        from feather.destinations.duckdb import DuckDBDestination
+
+        db_path = tmp_path / "data.duckdb"
+        dest = DuckDBDestination(path=db_path)
+        # Don't create schemas — CREATE TABLE in nonexistent schema triggers rollback
+        data = _sample_arrow_table(5)
+        with pytest.raises(Exception):
+            dest.load_full("nonexistent_schema.bad_table", data, "run_fail")

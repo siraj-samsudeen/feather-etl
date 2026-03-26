@@ -192,3 +192,16 @@ class TestValidationJson:
         vj = json.loads((tmp_path / "feather_validation.json").read_text())
         assert vj["valid"] is False
         assert "bad source type" in vj["errors"]
+
+
+class TestEnvVarEdgeCases:
+    def test_numeric_values_pass_through(self, tmp_path: Path):
+        """config.py line 73: non-string values returned as-is."""
+        from feather.config import load_config
+
+        cfg = _minimal_config(tmp_path)
+        cfg["defaults"] = {"overlap_window_minutes": 5, "batch_size": 50000}
+        config_file = _write_config(tmp_path, cfg)
+        result = load_config(config_file)
+        assert result.defaults.overlap_window_minutes == 5
+        assert result.defaults.batch_size == 50000
