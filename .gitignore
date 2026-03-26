@@ -1,4 +1,15 @@
 .worktrees/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+.venv/
+*.duckdb.wal
+feather_data.duckdb
+feather_state.duckdb
+feather_validation.json
+.env
 .DS_Store
+.coverage
 .nvmrc
 repomix-output.xml
