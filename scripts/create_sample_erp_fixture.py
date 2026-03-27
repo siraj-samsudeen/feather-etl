@@ -89,16 +89,44 @@ def create_fixture(path: Path) -> None:
         (3, 'Service Pack','Services',   1500.00, NULL)
     """)
 
+    # --- sales — purpose-built for incremental extraction tests (Slice 3) ---
+    con.execute("""
+        CREATE TABLE erp.sales (
+            sale_id     INTEGER PRIMARY KEY,
+            customer_id INTEGER,
+            amount      DECIMAL(10,2),
+            status      VARCHAR,
+            modified_at TIMESTAMP
+        )
+    """)
+    con.execute("""
+        INSERT INTO erp.sales VALUES
+        (1,  101, 100.00, 'completed',  '2025-01-01 00:00:00'),
+        (2,  102, 200.00, 'completed',  '2025-01-02 00:00:00'),
+        (3,  101, 300.00, 'completed',  '2025-01-03 00:00:00'),
+        (4,  103, 400.00, 'completed',  '2025-01-04 00:00:00'),
+        (5,  104, 500.00, 'completed',  '2025-01-05 00:00:00'),
+        (6,  101, 150.00, 'cancelled',  '2025-01-06 00:00:00'),
+        (7,  102, 250.00, 'completed',  '2025-01-07 00:00:00'),
+        (8,  103, 350.00, 'completed',  '2025-01-08 00:00:00'),
+        (9,  104, 450.00, 'cancelled',  '2025-01-09 00:00:00'),
+        (10, 101, 550.00, 'completed',  '2025-01-10 00:00:00')
+    """)
+
     con.close()
 
-    orders_n    = duckdb.connect(str(path), read_only=True).execute("SELECT COUNT(*) FROM erp.orders").fetchone()[0]
-    customers_n = duckdb.connect(str(path), read_only=True).execute("SELECT COUNT(*) FROM erp.customers").fetchone()[0]
-    products_n  = duckdb.connect(str(path), read_only=True).execute("SELECT COUNT(*) FROM erp.products").fetchone()[0]
+    con_r = duckdb.connect(str(path), read_only=True)
+    orders_n    = con_r.execute("SELECT COUNT(*) FROM erp.orders").fetchone()[0]
+    customers_n = con_r.execute("SELECT COUNT(*) FROM erp.customers").fetchone()[0]
+    products_n  = con_r.execute("SELECT COUNT(*) FROM erp.products").fetchone()[0]
+    sales_n     = con_r.execute("SELECT COUNT(*) FROM erp.sales").fetchone()[0]
+    con_r.close()
 
     print(f"Created {path}")
     print(f"  erp.orders:    {orders_n} rows")
     print(f"  erp.customers: {customers_n} rows")
     print(f"  erp.products:  {products_n} rows  (row 3 has NULL stock_qty)")
+    print(f"  erp.sales:     {sales_n} rows  (for incremental extraction tests)")
 
 
 if __name__ == "__main__":

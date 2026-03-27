@@ -148,6 +148,8 @@ class StateManager:
         last_file_mtime: float | None = None,
         last_file_hash: str | None = None,
         last_value: object = _SENTINEL,
+        last_checksum: int | None = None,
+        last_row_count: int | None = None,
     ) -> None:
         if last_run_at is None:
             last_run_at = datetime.now(timezone.utc)
@@ -161,20 +163,24 @@ class StateManager:
                     # Preserve existing last_value (H-1 fix)
                     con.execute(
                         "UPDATE _watermarks SET strategy = ?, last_run_at = ?, "
-                        "last_file_mtime = ?, last_file_hash = ? "
+                        "last_file_mtime = ?, last_file_hash = ?, "
+                        "last_checksum = ?, last_row_count = ? "
                         "WHERE table_name = ?",
                         [
                             strategy,
                             last_run_at,
                             last_file_mtime,
                             last_file_hash,
+                            last_checksum,
+                            last_row_count,
                             table_name,
                         ],
                     )
                 else:
                     con.execute(
                         "UPDATE _watermarks SET strategy = ?, last_run_at = ?, "
-                        "last_file_mtime = ?, last_file_hash = ?, last_value = ? "
+                        "last_file_mtime = ?, last_file_hash = ?, last_value = ?, "
+                        "last_checksum = ?, last_row_count = ? "
                         "WHERE table_name = ?",
                         [
                             strategy,
@@ -182,6 +188,8 @@ class StateManager:
                             last_file_mtime,
                             last_file_hash,
                             last_value,
+                            last_checksum,
+                            last_row_count,
                             table_name,
                         ],
                     )
@@ -189,8 +197,9 @@ class StateManager:
                 actual_value = None if last_value is self._SENTINEL else last_value
                 con.execute(
                     "INSERT INTO _watermarks "
-                    "(table_name, strategy, last_run_at, last_file_mtime, last_file_hash, last_value) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(table_name, strategy, last_run_at, last_file_mtime, last_file_hash, "
+                    "last_value, last_checksum, last_row_count) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         table_name,
                         strategy,
@@ -198,6 +207,8 @@ class StateManager:
                         last_file_mtime,
                         last_file_hash,
                         actual_value,
+                        last_checksum,
+                        last_row_count,
                     ],
                 )
         finally:

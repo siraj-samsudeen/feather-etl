@@ -34,6 +34,25 @@ class FileSource:
         """
         return self.path
 
+    def _build_where_clause(
+        self,
+        watermark_column: str | None,
+        watermark_value: str | None,
+        filter: str | None,
+    ) -> str:
+        """Build a SQL WHERE clause for watermark and/or filter conditions."""
+        clauses: list[str] = []
+        if watermark_column and watermark_value is not None:
+            clauses.append(f"{watermark_column} >= '{watermark_value}'")
+        if filter:
+            clauses.append(f"({filter})")
+        if not clauses:
+            return ""
+        suffix = " WHERE " + " AND ".join(clauses)
+        if watermark_column and watermark_value is not None:
+            suffix += f" ORDER BY {watermark_column}"
+        return suffix
+
     def _compute_file_hash(self, file_path: Path) -> str:
         """Compute MD5 hex digest of file contents, reading in 8KB chunks."""
         h = hashlib.md5()

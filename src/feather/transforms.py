@@ -1,0 +1,210 @@
+"""Silver/gold transform engine — parse, discover, order, and execute SQL transforms."""
+
+from __future__ import annotations
+
+import graphlib
+import logging
+import string
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import duckdb
+
+logger = logging.getLogger(__name__)
+
+VALID_SCHEMAS = {"silver", "gold"}
+
+
+@dataclass
+class TransformMeta:
+    """Metadata parsed from a .sql transform file."""
+
+    name: str
+    schema: str  # "silver" or "gold"
+    sql: str
+    depends_on: list[str] = field(default_factory=list)
+    materialized: bool = False
+    path: Path = field(default_factory=lambda: Path())
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+
+@dataclass
+class TransformResult:
+    """Result of executing a single transform."""
+
+    name: str
+    schema: str
+    type: str  # "view" or "table"
+    status: str  # "success" or "error"
+    error: str | None = None
+
+
+def parse_transform_file(path: Path) -> TransformMeta:
+    """Parse a .sql file into TransformMeta.
+
+    Header comment lines with ``-- depends_on: X`` and ``-- materialized: true``
+    are extracted as metadata. Everything else is treated as the SQL SELECT body.
+    """
+    text = path.read_text()
+    lines = text.splitlines()
+
+    depends_on: list[str] = []
+    materialized = False
+    sql_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("-- depends_on:"):
+            dep = stripped.removeprefix("-- depends_on:").strip()
+            if dep:
+                depends_on.append(dep)
+        elif stripped == "-- materialized: true":
+            materialized = True
+        else:
+            sql_lines.append(line)
+
+    # Strip leading/trailing blank lines from SQL body
+    sql = "\n".join(sql_lines).strip()
+
+    name = path.stem  # sales_invoice.sql -> sales_invoice
+    schema = path.parent.name  # transforms/silver/ -> silver
+
+    if schema not in VALID_SCHEMAS:
+        raise ValueError(
+            f"Transform '{path}' is in directory '{schema}', "
+            f"expected one of {sorted(VALID_SCHEMAS)}"
+        )
+
+    return TransformMeta(
+        name=name,
+        schema=schema,
+        sql=sql,
+        depends_on=depends_on,
+        materialized=materialized,
+        path=path,
+    )
+
+
+def discover_transforms(config_dir: Path) -> list[TransformMeta]:
+    """Scan transforms/silver/*.sql and transforms/gold/*.sql under config_dir.
+
+    Returns empty list if the transforms directory does not exist.
+    """
+    transforms_dir = config_dir / "transforms"
+    if not transforms_dir.is_dir():
+        return []
+
+    results: list[TransformMeta] = []
+    for schema_name in ("silver", "gold"):
+        schema_dir = transforms_dir / schema_name
+        if not schema_dir.is_dir():
+            continue
+        for sql_file in sorted(schema_dir.glob("*.sql")):
+            results.append(parse_transform_file(sql_file))
+
+    return results
+
+
+def build_execution_order(transforms: list[TransformMeta]) -> list[TransformMeta]:
+    """Topological sort of transforms based on depends_on declarations.
+
+    Dependencies on non-transform schemas (e.g. ``bronze.*``) are treated as
+    external and silently ignored — they exist in the extraction layer, not the
+    transform layer.  Dependencies on ``silver.*`` or ``gold.*`` that cannot be
+    resolved to a discovered transform raise ValueError.  Lets
+    graphlib.CycleError propagate on cycles.
+    """
+    by_name: dict[str, TransformMeta] = {t.qualified_name: t for t in transforms}
+
+    # Validate transform-layer dependencies exist; skip external ones (bronze, etc.)
+    for t in transforms:
+        for dep in t.depends_on:
+            dep_schema = dep.split(".")[0] if "." in dep else ""
+            if dep_schema in VALID_SCHEMAS and dep not in by_name:
+                raise ValueError(
+                    f"Transform '{t.qualified_name}' depends on '{dep}', "
+                    f"which was not found among discovered transforms. "
+                    f"Known: {sorted(by_name)}"
+                )
+
+    # Build dependency graph: node -> set of predecessors (transform-layer only)
+    graph: dict[str, set[str]] = {}
+    for t in transforms:
+        graph[t.qualified_name] = {
+            dep for dep in t.depends_on if dep.split(".")[0] in VALID_SCHEMAS
+        }
+
+    sorter = graphlib.TopologicalSorter(graph)
+    ordered_names = list(sorter.static_order())
+    return [by_name[name] for name in ordered_names]
+
+
+def execute_transforms(
+    con: duckdb.DuckDBPyConnection,
+    transforms: list[TransformMeta],
+    variables: dict[str, str] | None = None,
+) -> list[TransformResult]:
+    """Execute an already-sorted list of transforms against a DuckDB connection.
+
+    Silver transforms become VIEWs. Gold transforms become VIEWs by default,
+    or TABLEs when ``materialized=True``. On error, the transform is recorded
+    as failed and execution continues with the next transform.
+    """
+    results: list[TransformResult] = []
+    subs = variables or {}
+
+    for t in transforms:
+        sql = string.Template(t.sql).safe_substitute(subs)
+
+        if t.materialized and t.schema == "gold":
+            ddl = f"CREATE OR REPLACE TABLE {t.schema}.{t.name} AS {sql}"
+            obj_type = "table"
+        else:
+            ddl = f"CREATE OR REPLACE VIEW {t.schema}.{t.name} AS {sql}"
+            obj_type = "view"
+
+        try:
+            con.execute(ddl)
+            results.append(
+                TransformResult(
+                    name=t.name,
+                    schema=t.schema,
+                    type=obj_type,
+                    status="success",
+                )
+            )
+            logger.info("Created %s %s.%s", obj_type, t.schema, t.name)
+        except Exception as e:
+            error_msg = str(e)
+            results.append(
+                TransformResult(
+                    name=t.name,
+                    schema=t.schema,
+                    type=obj_type,
+                    status="error",
+                    error=error_msg,
+                )
+            )
+            logger.error(
+                "Failed to create %s %s.%s: %s", obj_type, t.schema, t.name, error_msg
+            )
+
+    return results
+
+
+def rebuild_materialized_gold(
+    con: duckdb.DuckDBPyConnection,
+    transforms: list[TransformMeta],
+    variables: dict[str, str] | None = None,
+) -> list[TransformResult]:
+    """Re-execute only materialized gold transforms as TABLEs.
+
+    Called after extraction to refresh gold tables with latest data.
+    """
+    mat_gold = [t for t in transforms if t.schema == "gold" and t.materialized]
+    if not mat_gold:
+        return []
+    return execute_transforms(con, mat_gold, variables)

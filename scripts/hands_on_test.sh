@@ -793,6 +793,127 @@ echo "$out" | grep -q "skipped (unchanged)" \
     && check "S22: touched file skipped (hash unchanged)" ok \
     || check "S22: touched file skipped (hash unchanged)" fail
 
+# ---------------------------------------------------------------------------
+# S-INCR — Incremental extraction
+# ---------------------------------------------------------------------------
+yellow "--- S-INCR: Incremental extraction ---"
+
+SINCR="$WORK_DIR/incr_test"
+mkdir -p "$SINCR"
+
+# Copy sample_erp.duckdb as incremental source
+cp "$FIXTURE_DIR/sample_erp.duckdb" "$SINCR/source.duckdb"
+
+# Write config with incremental strategy
+cat > "$SINCR/feather.yaml" <<YAML
+source:
+  type: duckdb
+  path: source.duckdb
+destination:
+  path: dest.duckdb
+tables:
+  - name: sales
+    source_table: erp.sales
+    target_table: bronze.sales
+    strategy: incremental
+    timestamp_column: modified_at
+YAML
+
+# S-INCR-1: First incremental run extracts all rows
+out=$("$FEATHER" run --config "$SINCR/feather.yaml" 2>&1) || true
+echo "$out" | grep -q "sales: success (10 rows)" \
+    && check "S-INCR-1: first incremental run extracts all 10 rows" ok \
+    || check "S-INCR-1: first incremental run extracts all 10 rows" fail
+
+# S-INCR-2: Verify watermark is set
+wm=$(.venv/bin/python -c "
+import duckdb
+con = duckdb.connect('$SINCR/feather_state.duckdb', read_only=True)
+row = con.execute(\"SELECT last_value FROM _watermarks WHERE table_name = 'sales'\").fetchone()
+print(row[0] if row else 'NONE')
+con.close()
+")
+[[ "$wm" == *"2025-01-10"* ]] \
+    && check "S-INCR-2: watermark set to MAX(modified_at) = 2025-01-10" ok \
+    || check "S-INCR-2: watermark set to MAX(modified_at) = 2025-01-10" fail
+
+# S-INCR-3: Second run, file unchanged → skipped
+out=$("$FEATHER" run --config "$SINCR/feather.yaml" 2>&1) || true
+echo "$out" | grep -q "skipped (unchanged)" \
+    && check "S-INCR-3: second run skips unchanged source" ok \
+    || check "S-INCR-3: second run skips unchanged source" fail
+
+# S-INCR-4: Add new rows → only new rows + overlap extracted
+.venv/bin/python -c "
+import duckdb
+con = duckdb.connect('$SINCR/source.duckdb')
+con.execute(\"INSERT INTO erp.sales VALUES (11, 105, 1100.00, 'completed', '2025-01-11 00:00:00'), (12, 106, 1200.00, 'completed', '2025-01-12 00:00:00')\")
+con.close()
+"
+out=$("$FEATHER" run --config "$SINCR/feather.yaml" 2>&1) || true
+echo "$out" | grep -q "sales: success (3 rows)" \
+    && check "S-INCR-4: incremental extracts only new + overlap rows (3)" ok \
+    || check "S-INCR-4: incremental extracts only new + overlap rows (3)" fail
+
+# S-INCR-5: Watermark advanced to new MAX
+wm2=$(.venv/bin/python -c "
+import duckdb
+con = duckdb.connect('$SINCR/feather_state.duckdb', read_only=True)
+row = con.execute(\"SELECT last_value FROM _watermarks WHERE table_name = 'sales'\").fetchone()
+print(row[0] if row else 'NONE')
+con.close()
+")
+[[ "$wm2" == *"2025-01-12"* ]] \
+    && check "S-INCR-5: watermark advanced to 2025-01-12" ok \
+    || check "S-INCR-5: watermark advanced to 2025-01-12" fail
+
+# S-INCR-6: Destination has correct total rows (12)
+dest_rows=$(.venv/bin/python -c "
+import duckdb
+con = duckdb.connect('$SINCR/dest.duckdb', read_only=True)
+print(con.execute('SELECT COUNT(*) FROM bronze.sales').fetchone()[0])
+con.close()
+")
+[[ "$dest_rows" == "12" ]] \
+    && check "S-INCR-6: destination has 12 total rows after incremental" ok \
+    || check "S-INCR-6: destination has 12 total rows after incremental" fail
+
+# S-INCR-7: Filter excludes matching rows
+SINCR_F="$WORK_DIR/incr_filter"
+mkdir -p "$SINCR_F"
+cp "$FIXTURE_DIR/sample_erp.duckdb" "$SINCR_F/source.duckdb"
+
+cat > "$SINCR_F/feather.yaml" <<YAML
+source:
+  type: duckdb
+  path: source.duckdb
+destination:
+  path: dest.duckdb
+tables:
+  - name: sales
+    source_table: erp.sales
+    target_table: bronze.sales
+    strategy: incremental
+    timestamp_column: modified_at
+    filter: "status <> 'cancelled'"
+YAML
+
+out=$("$FEATHER" run --config "$SINCR_F/feather.yaml" 2>&1) || true
+echo "$out" | grep -q "sales: success (8 rows)" \
+    && check "S-INCR-7: filter excludes cancelled rows (8 of 10 extracted)" ok \
+    || check "S-INCR-7: filter excludes cancelled rows (8 of 10 extracted)" fail
+
+# S-INCR-8: No cancelled rows in destination
+cancelled=$(.venv/bin/python -c "
+import duckdb
+con = duckdb.connect('$SINCR_F/dest.duckdb', read_only=True)
+print(con.execute(\"SELECT COUNT(*) FROM bronze.sales WHERE status = 'cancelled'\").fetchone()[0])
+con.close()
+")
+[[ "$cancelled" == "0" ]] \
+    && check "S-INCR-8: no cancelled rows in filtered destination" ok \
+    || check "S-INCR-8: no cancelled rows in filtered destination" fail
+
 echo ""
 
 # ---------------------------------------------------------------------------

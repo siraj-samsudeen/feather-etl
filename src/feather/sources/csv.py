@@ -58,9 +58,9 @@ class CsvSource(FileSource):
         con = duckdb.connect(":memory:")
         file_path = str(self.path / table)
         try:
-            result = con.execute(
-                "SELECT * FROM read_csv(?)", [file_path]
-            ).arrow().read_all()
+            query = f"SELECT * FROM read_csv('{file_path}')"
+            query += self._build_where_clause(watermark_column, watermark_value, filter)
+            result = con.execute(query).arrow().read_all()
         finally:
             con.close()
         return result

@@ -147,6 +147,14 @@ def _validate(config: FeatherConfig) -> list[str]:
         elif not config.source.path.exists():
             errors.append(f"Source path does not exist: {config.source.path}")
 
+    if (
+        config.source.type not in FILE_SOURCE_TYPES
+        and not config.source.connection_string
+    ):
+        errors.append(
+            f"Source type '{config.source.type}' requires a connection_string."
+        )
+
     if not config.destination.path.parent.exists():
         errors.append(
             f"Destination directory does not exist: {config.destination.path.parent}"

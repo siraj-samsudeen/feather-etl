@@ -97,6 +97,48 @@ def setup(config: Path = typer.Option("feather.yaml", "--config")) -> None:
     dest.setup_schemas()
     typer.echo(f"Schemas created in: {cfg.destination.path}")
 
+    # Execute transforms (silver views, gold views/tables) if any exist
+    from feather.transforms import (
+        build_execution_order,
+        discover_transforms,
+        execute_transforms,
+    )
+
+    transforms = discover_transforms(cfg.config_dir)
+    if transforms:
+        ordered = build_execution_order(transforms)
+        con = dest._connect()
+        try:
+            results = execute_transforms(con, ordered)
+        finally:
+            con.close()
+
+        silver_views = sum(
+            1 for r in results if r.schema == "silver" and r.status == "success"
+        )
+        gold_views = sum(
+            1
+            for r in results
+            if r.schema == "gold" and r.type == "view" and r.status == "success"
+        )
+        gold_tables = sum(
+            1
+            for r in results
+            if r.schema == "gold" and r.type == "table" and r.status == "success"
+        )
+        parts = []
+        if silver_views:
+            parts.append(f"{silver_views} silver view(s)")
+        if gold_views:
+            parts.append(f"{gold_views} gold view(s)")
+        if gold_tables:
+            parts.append(f"{gold_tables} gold table(s)")
+        typer.echo(f"Transforms applied: {', '.join(parts)}")
+
+        errors = [r for r in results if r.status == "error"]
+        for r in errors:
+            typer.echo(f"  Transform error: {r.schema}.{r.name} — {r.error}", err=True)
+
 
 @app.command()
 def run(config: Path = typer.Option("feather.yaml", "--config")) -> None:

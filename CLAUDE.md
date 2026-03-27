@@ -10,8 +10,8 @@ reference.
 Run the test suites and confirm both are green:
 
 ```bash
-uv run pytest -q               # currently: 162 tests
-bash scripts/hands_on_test.sh  # currently: 62 checks
+uv run pytest -q               # currently: 180 tests
+bash scripts/hands_on_test.sh  # currently: 70 checks
 ```
 
 If anything is red before you touch anything, report it immediately — don't
@@ -36,6 +36,7 @@ Copy the header format from any existing plan in `docs/plans/`.
 |---|---|---|
 | 1 — foundation + CSV/SQLite sources | `docs/plans/2026-03-26-slice1-foundation.md` | VERIFIED |
 | 2 — change detection | `docs/plans/2026-03-27-slice2-change-detection.md` | VERIFIED |
+| 3 — incremental extraction | `docs/plans/2026-03-27-slice3-incremental-extraction.md` | VERIFIED |
 
 ## If you are fixing bugs from a review
 

@@ -71,3 +71,12 @@ def sqlite_db(tmp_path) -> Path:
     dst = tmp_path / "sample_erp.sqlite"
     shutil.copy2(src, dst)
     return dst
+
+
+@pytest.fixture
+def sample_erp_db(tmp_path) -> Path:
+    """Copy sample_erp DuckDB to tmp_path (includes erp.sales for incremental tests)."""
+    src = FIXTURES_DIR / "sample_erp.duckdb"
+    dst = tmp_path / "sample_erp.duckdb"
+    shutil.copy2(src, dst)
+    return dst
