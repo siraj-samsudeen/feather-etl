@@ -1798,10 +1798,10 @@ source: client.duckdb with ModifiedDate column
 |-------|----------|---------------|
 | V4 | Column selection + silver-direct | `column_map` in config, PyArrow zero-copy rename, `target_table: silver.*` default for SMB clients |
 | V5 | `feather run --table`, `feather history` | Single-table runs, run history CLI |
-| V6 | Additional file sources | SqliteSource (already partially built in V1), JsonSource, ExcelSource |
+| V6 | Additional file sources | SqliteSource (already partially built in V1), JsonSource, ExcelSource. Multi-file CSV tables (e.g., `sales_*.csv` → single table via glob pattern config) — requires config schema + Source protocol changes. |
 | V7 | SQL Server source | DatabaseSource base, pyodbc, CHECKSUM_AGG + COUNT change detection, mocked tests |
 | V8 | Silver/gold transforms | SQL files as views, `-- depends_on`, `-- materialized: true`, topological ordering |
-| V9 | DQ checks | Declarative not_null/unique/row_count, `_dq_results`, pipeline continues on failure |
+| V9 | DQ checks | Declarative not_null/unique/row_count, `_dq_results`, pipeline continues on failure. Duplicate CSV detection: same data under different filenames or overlapping date-range re-exports in same directory (hash-based or row-level dedup). |
 | V10 | Schema drift detection | Schema snapshots, added/removed/type_changed classification, handling per FR4.9 |
 | V11 | SMTP alerting | `[CRITICAL]`/`[WARNING]`/`[INFO]` email, no-op if unconfigured |
 | V12 | Append strategy | Insert-only load, compliance/audit trail pattern |

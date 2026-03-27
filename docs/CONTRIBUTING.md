@@ -138,10 +138,13 @@ Prior review: <path, if this is review-2+>
 | `tests/fixtures/client.duckdb` | `icube.*`, 6 tables, ~14K rows | Real-world ERP data, messy schemas |
 | `tests/fixtures/client_update.duckdb` | `icube.*`, 3 tables, ~12K rows | Future incremental/append tests |
 | `tests/fixtures/sample_erp.duckdb` | `erp.*`, 3 tables, 12 rows | Fast tests, NULL handling, simple schema |
+| `tests/fixtures/sample_erp.sqlite` | `erp.*`, 3 tables, 12 rows | SQLite source tests |
+| `tests/fixtures/csv_data/` | 3 CSV files (orders, customers, products) | CSV source tests |
 
-To regenerate `sample_erp.duckdb`:
+To regenerate fixtures:
 ```bash
-python scripts/create_sample_erp_fixture.py
+python scripts/create_sample_erp_fixture.py        # DuckDB
+python scripts/create_csv_sqlite_fixtures.py       # CSV + SQLite
 ```
 
 ---
