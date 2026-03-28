@@ -3,9 +3,8 @@
 # hands_on_test.sh — Reproduce the full hands-on review workflow
 #
 # This script recreates every scenario tested in the slice-1 hands-on review.
-# Run it from the repo root with the venv active:
+# Run it from the repo root:
 #
-#   source .venv/bin/activate
 #   bash scripts/hands_on_test.sh
 #
 # It prints PASS/FAIL for each scenario.  A non-zero exit means at least one
@@ -109,7 +108,7 @@ echo "$out" | grep -q "Config valid: 3 table" \
     && check "feather_validation.json written" ok \
     || check "feather_validation.json written" fail
 
-python3 -c "
+uv run python -c "
 import json, sys
 d = json.load(open('$S2/feather_validation.json'))
 assert d['valid'] is True
@@ -252,7 +251,7 @@ echo "$out" | grep -q "3/3 tables extracted" \
     || check "run creates feather_data.duckdb" fail
 
 # verify row counts in bronze
-python3 -c "
+uv run python -c "
 import duckdb
 con = duckdb.connect('$S2/feather_data.duckdb', read_only=True)
 assert con.execute('SELECT COUNT(*) FROM bronze.sales_invoice').fetchone()[0]   == 11676
@@ -264,7 +263,7 @@ con.close()
     || check "row counts correct: sales_invoice=11676 customer=1339 inv_group=66" fail
 
 # verify _etl metadata columns exist
-python3 -c "
+uv run python -c "
 import duckdb
 con = duckdb.connect('$S2/feather_data.duckdb', read_only=True)
 cols = [r[0] for r in con.execute(\"SELECT column_name FROM information_schema.columns WHERE table_schema='bronze' AND table_name='sales_invoice'\").fetchall()]
@@ -332,7 +331,7 @@ code=$("$FEATHER" run --config "$S6/feather.yaml" > /dev/null 2>&1; echo $?) || 
     || check "exit code non-zero on partial failure" fail
 
 # error is stored in state DB
-python3 -c "
+uv run python -c "
 import duckdb
 con = duckdb.connect('$S6/feather_state.duckdb', read_only=True)
 row = con.execute(\"SELECT error_message FROM _runs WHERE table_name='bad_table' AND status='failure' LIMIT 1\").fetchone()
@@ -402,7 +401,7 @@ echo "$out" | grep -q "3/3 tables extracted" \
     || check "sample_erp: 3/3 tables succeed" fail
 
 # NULL in stock_qty passes through
-python3 -c "
+uv run python -c "
 import duckdb
 con = duckdb.connect('$S8/feather_data.duckdb', read_only=True)
 row = con.execute(\"SELECT stock_qty FROM bronze.products WHERE product_name='Service Pack'\").fetchone()
@@ -413,7 +412,7 @@ con.close()
     || check "NULL stock_qty passes through correctly" fail
 
 # verify exact row counts
-python3 -c "
+uv run python -c "
 import duckdb
 con = duckdb.connect('$S8/feather_data.duckdb', read_only=True)
 assert con.execute('SELECT COUNT(*) FROM bronze.orders').fetchone()[0]    == 5
@@ -511,7 +510,7 @@ echo "$out" | grep -q "inv_item: success" \
     && check "INVITEM (has BLOB columns, ~200 cols) loads successfully" ok \
     || check "INVITEM (has BLOB columns, ~200 cols) loads successfully" fail
 
-python3 -c "
+uv run python -c "
 import duckdb
 con = duckdb.connect('$S11/feather_data.duckdb', read_only=True)
 cols = [r[0] for r in con.execute(\"SELECT column_name FROM information_schema.columns WHERE table_name='sales_invoice_master'\").fetchall()]
@@ -774,7 +773,7 @@ code=$("$FEATHER" run --config "$S19/feather.yaml" > /dev/null 2>&1; echo $?) ||
     || check "S20: skipped run exits with code 0" fail
 
 # S21: Modify source → re-extracts
-.venv/bin/python -c "
+uv run python -c "
 import duckdb
 con = duckdb.connect('$S19/source.duckdb')
 con.execute(\"INSERT INTO erp.orders (order_id, customer_id, order_date, total_amount, status) VALUES (99, 99, '2026-01-01', 999.99, 'new')\")
@@ -826,7 +825,7 @@ echo "$out" | grep -q "sales: success (10 rows)" \
     || check "S-INCR-1: first incremental run extracts all 10 rows" fail
 
 # S-INCR-2: Verify watermark is set
-wm=$(.venv/bin/python -c "
+wm=$(uv run python -c "
 import duckdb
 con = duckdb.connect('$SINCR/feather_state.duckdb', read_only=True)
 row = con.execute(\"SELECT last_value FROM _watermarks WHERE table_name = 'sales'\").fetchone()
@@ -844,7 +843,7 @@ echo "$out" | grep -q "skipped (unchanged)" \
     || check "S-INCR-3: second run skips unchanged source" fail
 
 # S-INCR-4: Add new rows → only new rows + overlap extracted
-.venv/bin/python -c "
+uv run python -c "
 import duckdb
 con = duckdb.connect('$SINCR/source.duckdb')
 con.execute(\"INSERT INTO erp.sales VALUES (11, 105, 1100.00, 'completed', '2025-01-11 00:00:00'), (12, 106, 1200.00, 'completed', '2025-01-12 00:00:00')\")
@@ -856,7 +855,7 @@ echo "$out" | grep -q "sales: success (3 rows)" \
     || check "S-INCR-4: incremental extracts only new + overlap rows (3)" fail
 
 # S-INCR-5: Watermark advanced to new MAX
-wm2=$(.venv/bin/python -c "
+wm2=$(uv run python -c "
 import duckdb
 con = duckdb.connect('$SINCR/feather_state.duckdb', read_only=True)
 row = con.execute(\"SELECT last_value FROM _watermarks WHERE table_name = 'sales'\").fetchone()
@@ -868,7 +867,7 @@ con.close()
     || check "S-INCR-5: watermark advanced to 2025-01-12" fail
 
 # S-INCR-6: Destination has correct total rows (12)
-dest_rows=$(.venv/bin/python -c "
+dest_rows=$(uv run python -c "
 import duckdb
 con = duckdb.connect('$SINCR/dest.duckdb', read_only=True)
 print(con.execute('SELECT COUNT(*) FROM bronze.sales').fetchone()[0])
@@ -904,7 +903,7 @@ echo "$out" | grep -q "sales: success (8 rows)" \
     || check "S-INCR-7: filter excludes cancelled rows (8 of 10 extracted)" fail
 
 # S-INCR-8: No cancelled rows in destination
-cancelled=$(.venv/bin/python -c "
+cancelled=$(uv run python -c "
 import duckdb
 con = duckdb.connect('$SINCR_F/dest.duckdb', read_only=True)
 print(con.execute(\"SELECT COUNT(*) FROM bronze.sales WHERE status = 'cancelled'\").fetchone()[0])

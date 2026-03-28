@@ -247,8 +247,10 @@ def run_all(
         results.append(result)
 
     # Post-extraction transforms (mode-dependent)
-    any_success = any(r.status == "success" for r in results)
-    if any_success:
+    # Include skipped tables: transforms must run even when extraction is
+    # skipped (e.g. mode switch dev→prod needs to rematerialise gold).
+    any_ok = any(r.status in ("success", "skipped") for r in results)
+    if any_ok:
         try:
             from feather.transforms import (
                 build_execution_order,

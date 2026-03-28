@@ -24,6 +24,7 @@ class TransformMeta:
     sql: str
     depends_on: list[str] = field(default_factory=list)
     materialized: bool = False
+    fact_table: str | None = None
     path: Path = field(default_factory=lambda: Path())
 
     @property
@@ -55,6 +56,8 @@ def parse_transform_file(path: Path) -> TransformMeta:
     materialized = False
     sql_lines: list[str] = []
 
+    fact_table: str | None = None
+
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("-- depends_on:"):
@@ -63,6 +66,8 @@ def parse_transform_file(path: Path) -> TransformMeta:
                 depends_on.append(dep)
         elif stripped == "-- materialized: true":
             materialized = True
+        elif stripped.startswith("-- fact_table:"):
+            fact_table = stripped.removeprefix("-- fact_table:").strip() or None
         else:
             sql_lines.append(line)
 
@@ -84,6 +89,7 @@ def parse_transform_file(path: Path) -> TransformMeta:
         sql=sql,
         depends_on=depends_on,
         materialized=materialized,
+        fact_table=fact_table,
         path=path,
     )
 
@@ -161,9 +167,19 @@ def execute_transforms(
         sql = string.Template(t.sql).safe_substitute(subs)
 
         if t.materialized and t.schema == "gold" and not force_views:
+            # DROP existing VIEW — CREATE OR REPLACE TABLE can't replace a VIEW
+            try:
+                con.execute(f"DROP VIEW IF EXISTS {t.schema}.{t.name}")
+            except duckdb.CatalogException:
+                pass  # object exists but isn't a VIEW — TABLE replace handles it
             ddl = f"CREATE OR REPLACE TABLE {t.schema}.{t.name} AS {sql}"
             obj_type = "table"
         else:
+            # DROP existing TABLE — CREATE OR REPLACE VIEW can't replace a TABLE
+            try:
+                con.execute(f"DROP TABLE IF EXISTS {t.schema}.{t.name}")
+            except duckdb.CatalogException:
+                pass  # object exists but isn't a TABLE — VIEW replace handles it
             ddl = f"CREATE OR REPLACE VIEW {t.schema}.{t.name} AS {sql}"
             obj_type = "view"
 
@@ -196,6 +212,45 @@ def execute_transforms(
     return results
 
 
+def check_join_health(
+    con: duckdb.DuckDBPyConnection,
+    transform: TransformMeta,
+) -> str | None:
+    """Compare gold table row count against its declared fact table.
+
+    Returns a warning message if counts differ, None if healthy.
+    Requires ``-- fact_table: silver.X`` comment in the gold SQL file.
+    """
+    if not transform.fact_table:
+        return None
+
+    try:
+        gold_count = con.execute(
+            f"SELECT COUNT(*) FROM {transform.qualified_name}"
+        ).fetchone()[0]
+        fact_count = con.execute(
+            f"SELECT COUNT(*) FROM {transform.fact_table}"
+        ).fetchone()[0]
+    except Exception as e:
+        return f"Join health check failed for {transform.qualified_name}: {e}"
+
+    if gold_count == fact_count:
+        return None
+
+    diff = gold_count - fact_count
+    if diff > 0:
+        return (
+            f"JOIN INFLATION: {transform.qualified_name} has {gold_count:,} rows "
+            f"but fact table {transform.fact_table} has {fact_count:,} rows "
+            f"(+{diff:,} extra). Check for duplicate keys in dimension tables."
+        )
+    return (
+        f"JOIN LOSS: {transform.qualified_name} has {gold_count:,} rows "
+        f"but fact table {transform.fact_table} has {fact_count:,} rows "
+        f"({diff:,} missing). Check for INNER JOINs or missing dimension matches."
+    )
+
+
 def rebuild_materialized_gold(
     con: duckdb.DuckDBPyConnection,
     transforms: list[TransformMeta],
@@ -204,8 +259,16 @@ def rebuild_materialized_gold(
     """Re-execute only materialized gold transforms as TABLEs.
 
     Called after extraction to refresh gold tables with latest data.
+    Runs join health checks for transforms with ``-- fact_table:`` declared.
     """
     mat_gold = [t for t in transforms if t.schema == "gold" and t.materialized]
     if not mat_gold:
         return []
-    return execute_transforms(con, mat_gold, variables)
+    results = execute_transforms(con, mat_gold, variables)
+
+    for t in mat_gold:
+        warning = check_join_health(con, t)
+        if warning:
+            logger.warning(warning)
+
+    return results

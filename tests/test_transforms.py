@@ -796,8 +796,89 @@ class TestPipelineTransformRebuild:
         assert len(gold_rows) == 2
         con.close()
 
+    def test_run_mode_switch_rematerializes_gold(self, tmp_path: Path):
+        """Dev→prod mode switch rematerializes gold VIEW as TABLE even when extraction skipped."""
+        import yaml
+
+        from feather.config import load_config
+        from feather.pipeline import run_all
+
+        # Create source with data
+        source_db = tmp_path / "source.duckdb"
+        con = duckdb.connect(str(source_db))
+        con.execute("CREATE SCHEMA IF NOT EXISTS erp")
+        con.execute("CREATE TABLE erp.employees (id INT, name VARCHAR)")
+        con.execute("INSERT INTO erp.employees VALUES (1, 'Alice'), (2, 'Bob')")
+        con.close()
+
+        dest_db = tmp_path / "feather_data.duckdb"
+        config = {
+            "source": {"type": "duckdb", "path": str(source_db)},
+            "destination": {"path": str(dest_db)},
+            "mode": "dev",
+            "tables": [
+                {
+                    "name": "employees",
+                    "source_table": "erp.employees",
+                    "target_table": "bronze.employees",
+                    "strategy": "full",
+                }
+            ],
+        }
+        config_file = tmp_path / "feather.yaml"
+        config_file.write_text(yaml.dump(config))
+
+        # Write transforms
+        _write_sql(
+            tmp_path,
+            "silver",
+            "emp_clean",
+            "SELECT id, name AS employee_name FROM bronze.employees",
+        )
+        _write_sql(
+            tmp_path,
+            "gold",
+            "emp_snapshot",
+            (
+                "-- depends_on: silver.emp_clean\n"
+                "-- materialized: true\n"
+                "SELECT * FROM silver.emp_clean"
+            ),
+        )
+
+        # Run 1: dev mode — gold should be a VIEW
+        cfg_dev = load_config(config_file)
+        results1 = run_all(cfg_dev, config_file)
+        assert any(r.status == "success" for r in results1)
+
+        con = duckdb.connect(str(dest_db))
+        gold_type_dev = con.execute(
+            "SELECT table_type FROM information_schema.tables "
+            "WHERE table_schema='gold' AND table_name='emp_snapshot'"
+        ).fetchone()[0]
+        con.close()
+        assert gold_type_dev == "VIEW"
+
+        # Run 2: switch to prod mode — extraction skipped (unchanged), but gold should become TABLE
+        config["mode"] = "prod"
+        config_file.write_text(yaml.dump(config))
+        cfg_prod = load_config(config_file)
+        results2 = run_all(cfg_prod, config_file)
+        assert all(r.status == "skipped" for r in results2)
+
+        con = duckdb.connect(str(dest_db))
+        gold_type_prod = con.execute(
+            "SELECT table_type FROM information_schema.tables "
+            "WHERE table_schema='gold' AND table_name='emp_snapshot'"
+        ).fetchone()[0]
+        con.close()
+        assert gold_type_prod == "BASE TABLE", (
+            f"Expected gold to be materialized as BASE TABLE after prod mode switch, "
+            f"got {gold_type_prod}"
+        )
+
     def test_run_no_rebuild_when_all_skipped(self, tmp_path: Path):
-        """If all tables are skipped, gold is not rebuilt."""
+        """If all tables are skipped, gold table still exists from prior run."""
         import yaml
 
         from feather.config import load_config

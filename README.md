@@ -66,6 +66,10 @@ MotherDuck → Rill Data / BI tools
 | JSON | `read_json()` | mtime + MD5 hash | — |
 | SQL Server | pyodbc → PyArrow | CHECKSUM_AGG + COUNT(*) | ✓ |
 
+**CSV note:** `source_table` must include the `.csv` extension (e.g., `orders.csv` not `orders`).
+
+**Change detection** is file-level — for multi-table sources like DuckDB, modifying any table in the file triggers re-extraction of all tables from that file.
+
 New sources: implement the `Source` Protocol (~30 lines for file sources, ~80 lines for database sources) and register in the source registry.
 
 ## Load Strategies
@@ -105,12 +109,14 @@ feather validate                       # validate config, resolve paths — no e
 feather discover                       # list all tables in the configured source
 
 # Pipeline operations
-feather setup                          # preview and init state DB + schemas (optional — run creates them automatically)
+feather setup                          # init state DB + schemas + apply transforms (optional — run creates them automatically)
 feather run                            # run all tables
 feather status                         # last run status per table (all-time history)
 ```
 
-All commands accept `--config PATH` (default: `feather.yaml`).
+All commands accept `--config PATH` (default: `feather.yaml`). `run` and `setup` accept `--mode dev|prod|test` to override the config mode.
+
+**Note:** `feather setup --mode prod` applies gold transforms as materialized tables, which requires bronze/silver data to already exist. Run `feather run` first, then `feather setup --mode prod` to materialize gold.
 
 ## Client Project Layout
 
@@ -197,11 +203,10 @@ tables:
     primary_key: [ID]
 ```
 
-Silver views over bronze live in `transforms/silver/sales_invoice.sql`:
+Silver views over bronze live in `transforms/silver/sales_invoice.sql`. Transform files contain only the SELECT query — the system wraps it in the appropriate `CREATE OR REPLACE VIEW` or `CREATE OR REPLACE TABLE` DDL based on mode and the `-- materialized` flag:
 
 ```sql
 -- depends_on: (none — reads from bronze directly)
-CREATE OR REPLACE VIEW silver.sales_invoice AS
 SELECT
     ID           AS invoice_id,
     SI_NO        AS invoice_no,
@@ -234,11 +239,12 @@ Declare dependencies with a SQL comment — the system builds the execution orde
 -- depends_on: silver.sales_invoice
 -- depends_on: silver.customer_master
 -- materialized: true
-CREATE OR REPLACE TABLE gold.sales_summary AS
 SELECT ...
 FROM silver.sales_invoice si
 JOIN silver.customer_master cm ON si.customer_code = cm.customer_code
 ```
+
+Transform files contain only the SELECT body plus header comments. The system generates the DDL: silver transforms become VIEWs, gold transforms with `-- materialized: true` become TABLEs in prod mode (VIEWs in dev/test).
 
 ## Dependencies
 
