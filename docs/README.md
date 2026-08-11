@@ -12,6 +12,7 @@ Documentation for feather-flow lives here. This file is the map — read it firs
 
 ## Sub-folders (each has its own `README.md` hub)
 
+- [`agents/`](agents/README.md) — per-repo configuration the engineering skills read: issue tracker, triage labels, domain-doc layout. Written by `/setup-matt-pocock-skills`; edit the files directly to change them.
 - [`architecture/`](architecture/README.md) — project-level architectural decisions with long half-life (warehouse-layers model, etc.). Cited by transform designs, porting decisions, schema choices.
 - [`conventions/`](conventions/README.md) — how we work: code-layout template, spec template, testing patterns. Applies to every contributor.
 - [`issues/`](issues/README.md) — per-issue working notes captured during brainstorming, before a design spec lands.
