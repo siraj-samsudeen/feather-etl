@@ -8,6 +8,7 @@ Config-driven Python ETL for heterogeneous ERP sources → local DuckDB.
 **Architecture (warehouse model):** `docs/architecture/warehouse-layers.md` — four-layer Bronze/Silver/Gold/Departmental-Data-Marts model. Read before writing any transform SQL.
 **Personas:** `docs/personas.md` — Builder, Analyst, artifact consumers. Cite by version in every feature spec.
 **Work conventions:** `docs/CONTRIBUTING.md`
+**Naming:** `docs/conventions/naming-conventions.md` — every name must be **self-evident**: no acronyms or house codes, readable by an industry veteran, understood by a newcomer on first explanation and easily remembered, using terminology AI agents are trained on. Read before naming any column, value, config key, status or glossary term. Shared byte-identical with `rama_dw`.
 
 ## Where to find things
 
