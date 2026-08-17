@@ -7,6 +7,7 @@ Read the relevant doc before making a decision in its domain. Cite it by filenam
 ## Contents
 
 - [`warehouse-layers.md`](warehouse-layers.md) — the four-layer warehouse model (Bronze → Silver → Gold → Departmental Data Marts). Pins what belongs in each layer, how to decide the layer for a new transform, and naming conventions. Source of truth for all transform design.
+- [`multi-client-monitoring.md`](multi-client-monitoring.md) — load monitoring across many client deployments: one central control plane (enrollment, register, findings) with per-deployment isolated collection. Pins that tenancy is data rather than location, and that every columnless namespace carries a tenant slug. Read before designing the source register, the control-plane schema, or any externally-namespaced asset name.
 
 ## When to add a doc here
 
